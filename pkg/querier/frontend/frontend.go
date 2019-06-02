@@ -13,7 +13,6 @@ import (
 
 	"github.com/NYTimes/gziphandler"
 	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
 	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -31,12 +30,6 @@ var (
 		Name:      "query_frontend_queue_duration_seconds",
 		Help:      "Time spend by requests queued.",
 		Buckets:   prometheus.DefBuckets,
-	})
-	retries = promauto.NewHistogram(prometheus.HistogramOpts{
-		Namespace: "cortex",
-		Name:      "query_frontend_retries",
-		Help:      "Number of times a request is retried.",
-		Buckets:   []float64{0, 1, 2, 3, 4, 5},
 	})
 	queueLength = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: "cortex",
@@ -121,6 +114,9 @@ func New(cfg Config, log log.Logger, limits *validation.Overrides) (*Frontend, e
 			return nil, err
 		}
 		ms = append(ms, queryrange.InstrumentMiddleware("results_cache", queryRangeDuration), queryCacheMiddleware)
+	}
+	if cfg.MaxRetries > 0 {
+		ms = append(ms, queryrange.InstrumentMiddleware("retry", queryRangeDuration), queryrange.NewRetryMiddleware(log, cfg.MaxRetries))
 	}
 
 	// Finally, if the user selected any query range middleware, stitch it in.
@@ -212,7 +208,7 @@ func (f *Frontend) RoundTripGRPC(ctx context.Context, req *ProcessRequest) (*Pro
 		tracer.Inject(span.Context(), opentracing.HTTPHeaders, carrier)
 	}
 
-	request := &request{
+	request := request{
 		request:     req,
 		originalCtx: ctx,
 		// Buffer of 1 to ensure response can be written even if client has gone away.
@@ -220,50 +216,20 @@ func (f *Frontend) RoundTripGRPC(ctx context.Context, req *ProcessRequest) (*Pro
 		response: make(chan *ProcessResponse, 1),
 	}
 
-	var lastErr error
-	// TODO(bwplotka): Move it to separate retry middleware.
-	for tries := 0; tries < f.cfg.MaxRetries; tries++ {
-		if err := f.queueRequest(ctx, request); err != nil {
-			return nil, err
-		}
+	if err := f.queueRequest(ctx, &request); err != nil {
+		return nil, err
+	}
 
-		var resp *ProcessResponse
-		select {
-		case <-ctx.Done():
-			return nil, errCanceled
+	select {
+	case <-ctx.Done():
+		return nil, errCanceled
 
-		case resp = <-request.response:
-		case lastErr = <-request.err:
-			httpResp, ok := httpgrpc.HTTPResponseFromError(lastErr)
-			if ok {
-				resp = &ProcessResponse{
-					HttpResponse: httpResp,
-				}
-			}
-		}
-
-		// Retry is we get a HTTP 500.
-		if resp != nil && resp.HttpResponse.Code/100 == 5 {
-			level.Error(f.log).Log("msg", "error processing request", "try", tries, "resp", resp.HttpResponse)
-			continue
-		}
-
-		// Also retry for non-HTTP errors.
-		if resp == nil && lastErr != nil {
-			level.Error(f.log).Log("msg", "error processing request", "try", tries, "err", lastErr)
-			continue
-		}
-
-		retries.Observe(float64(tries))
-
+	case resp := <-request.response:
 		return resp, nil
-	}
 
-	if lastErr != nil {
-		return nil, lastErr
+	case err := <-request.err:
+		return nil, err
 	}
-
-	return nil, httpgrpc.Errorf(http.StatusInternalServerError, "Query failed after %d retries.", f.cfg.MaxRetries)
 }
 
 // Process allows backends to pull requests from the frontend.
