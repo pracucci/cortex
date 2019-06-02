@@ -52,7 +52,7 @@ var (
 var dummyResponse = &APIResponse{
 	Status: statusSuccess,
 	Data: Response{
-		ResultType: Matrix,
+		ResultType: matrix,
 		Result: []SampleStream{
 			{
 				Labels: []client.LabelAdapter{
@@ -81,7 +81,7 @@ func mkAPIResponse(start, end, step int64) *APIResponse {
 	return &APIResponse{
 		Status: statusSuccess,
 		Data: Response{
-			ResultType: Matrix,
+			ResultType: matrix,
 			Result: []SampleStream{
 				{
 					Labels: []client.LabelAdapter{
@@ -229,7 +229,7 @@ func TestResultsCache(t *testing.T) {
 	require.Equal(t, parsedResponse, resp)
 
 	// Doing request with new end time should do one more query.
-	req := parsedRequest.Copy()
+	req := parsedRequest.copy()
 	req.End += 100
 	resp, err = rc.Do(ctx, &req)
 	require.NoError(t, err)
@@ -243,7 +243,7 @@ func TestResultsCacheRecent(t *testing.T) {
 	rcm, err := NewResultsCacheMiddlewareFromConfig(log.NewNopLogger(), cfg, fakeLimits{})
 	require.NoError(t, err)
 
-	req := parsedRequest.Copy()
+	req := parsedRequest.copy()
 	req.End = int64(model.Now())
 	req.Start = req.End - (60 * 1e3)
 

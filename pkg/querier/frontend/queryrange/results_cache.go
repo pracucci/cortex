@@ -119,7 +119,7 @@ func (s resultsCacheMiddleware) handleHit(ctx context.Context, r *Request, exten
 
 	requests, responses := partition(r, extents)
 	if len(requests) == 0 {
-		response, err := MergeAPIResponses(responses)
+		response, err := mergeAPIResponses(responses)
 		// No downstream requests so no need to write back to the cache.
 		return response, nil, err
 	}
@@ -151,7 +151,7 @@ func (s resultsCacheMiddleware) handleHit(ctx context.Context, r *Request, exten
 		}
 
 		accumulator.End = extents[i].End
-		accumulator.Response, err = MergeAPIResponses([]*APIResponse{accumulator.Response, extents[i].Response})
+		accumulator.Response, err = mergeAPIResponses([]*APIResponse{accumulator.Response, extents[i].Response})
 		if err != nil {
 			return nil, nil, err
 		}
@@ -159,7 +159,7 @@ func (s resultsCacheMiddleware) handleHit(ctx context.Context, r *Request, exten
 	}
 	mergedExtents = append(mergedExtents, accumulator)
 
-	response, err := MergeAPIResponses(responses)
+	response, err := mergeAPIResponses(responses)
 	return response, mergedExtents, err
 }
 
@@ -177,7 +177,7 @@ func partition(req *Request, extents []Extent) ([]*Request, []*APIResponse) {
 
 		// If there is a bit missing at the front, make a request for that.
 		if start < extent.Start {
-			r := req.Copy()
+			r := req.copy()
 			r.Start = start
 			r.End = extent.Start
 			requests = append(requests, &r)
@@ -189,7 +189,7 @@ func partition(req *Request, extents []Extent) ([]*Request, []*APIResponse) {
 	}
 
 	if start < req.End {
-		r := req.Copy()
+		r := req.copy()
 		r.Start = start
 		r.End = req.End
 		requests = append(requests, &r)
