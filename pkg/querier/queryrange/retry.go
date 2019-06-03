@@ -2,7 +2,6 @@ package queryrange
 
 import (
 	"context"
-	"net/http"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
@@ -37,18 +36,19 @@ func NewRetryMiddleware(log log.Logger, maxRetries int) Middleware {
 }
 
 func (r retry) Do(ctx context.Context, req *Request) (*APIResponse, error) {
-	var lastErr error
-	for tries := 0; tries < r.maxRetries; tries++ {
-		retries.Observe(float64(tries))
+	tries := 0
+	defer func() { retries.Observe(float64(tries)) }()
 
+	var lastErr error
+	for ; tries < r.maxRetries; tries++ {
 		resp, err := r.next.Do(ctx, req)
 		if err == nil {
 			return resp, nil
 		}
 
-		// Retry is we get a HTTP 500 or a non-HTTP error.
+		// Retry if we get a HTTP 500 or a non-HTTP error.
 		httpResp, ok := httpgrpc.HTTPResponseFromError(err)
-		if !ok || (ok && httpResp.Code/100 == 5) {
+		if !ok || httpResp.Code/100 == 5 {
 			lastErr = err
 			level.Error(r.log).Log("msg", "error processing request", "try", tries, "err", err)
 			continue
@@ -56,11 +56,5 @@ func (r retry) Do(ctx context.Context, req *Request) (*APIResponse, error) {
 
 		return nil, err
 	}
-
-	if lastErr != nil {
-		return nil, lastErr
-	}
-
-	return nil, httpgrpc.Errorf(http.StatusInternalServerError, "Query failed after %d retries.", r.maxRetries)
-
+	return nil, lastErr
 }
