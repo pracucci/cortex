@@ -9,7 +9,7 @@ import (
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/storage"
 
-	"github.com/cortexproject/cortex/pkg/querier/frontend/queryrange"
+	"github.com/cortexproject/cortex/pkg/querier/queryrange"
 )
 
 // ChunksHandler allows you to fetch a compressed tar of all the chunks for a
