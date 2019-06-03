@@ -24,17 +24,14 @@ import (
 const statusSuccess = "success"
 
 var (
-	matrix = model.ValMatrix.String()
-
-	json = jsoniter.ConfigCompatibleWithStandardLibrary
-
+	matrix            = model.ValMatrix.String()
+	json              = jsoniter.ConfigCompatibleWithStandardLibrary
 	errEndBeforeStart = httpgrpc.Errorf(http.StatusBadRequest, "end timestamp must not be before start time")
 	errNegativeStep   = httpgrpc.Errorf(http.StatusBadRequest, "zero or negative query resolution step widths are not accepted. Try a positive integer")
 	errStepTooSmall   = httpgrpc.Errorf(http.StatusBadRequest, "exceeded maximum resolution of 11,000 points per timeseries. Try decreasing the query resolution (?step=XX)")
 )
 
-// ParseRequest parses a http.Request containing a Prometheus query range into a Request.
-func ParseRequest(r *http.Request) (*Request, error) {
+func parseRequest(r *http.Request) (*Request, error) {
 	var result Request
 	var err error
 	result.Start, err = ParseTime(r.FormValue("start"))

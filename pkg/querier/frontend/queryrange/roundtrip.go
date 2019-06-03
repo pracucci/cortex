@@ -93,7 +93,7 @@ func (q roundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
 		return q.next.RoundTrip(r)
 	}
 
-	request, err := ParseRequest(r)
+	request, err := parseRequest(r)
 	if err != nil {
 		return nil, err
 	}

@@ -101,34 +101,34 @@ func New(cfg Config, log log.Logger, limits *validation.Overrides) (*Frontend, e
 	}
 
 	// Stack up the pipeline of various query range middlewares.
-	var ms []queryrange.Middleware
+	var queryRangeMiddleware []queryrange.Middleware
 	if cfg.AlignQueriesWithStep {
-		ms = append(ms, queryrange.InstrumentMiddleware("step_align", queryRangeDuration), queryrange.StepAlignMiddleware)
+		queryRangeMiddleware = append(queryRangeMiddleware, queryrange.InstrumentMiddleware("step_align", queryRangeDuration), queryrange.StepAlignMiddleware)
 	}
 	if cfg.SplitQueriesByDay {
-		ms = append(ms, queryrange.InstrumentMiddleware("split_by_day", queryRangeDuration), queryrange.SplitByDayMiddleware(limits))
+		queryRangeMiddleware = append(queryRangeMiddleware, queryrange.InstrumentMiddleware("split_by_day", queryRangeDuration), queryrange.SplitByDayMiddleware(limits))
 	}
 	if cfg.CacheResults {
-		queryCacheMiddleware, err := queryrange.NewResultsCacheMiddlewareFromConfig(log, cfg.ResultsCacheConfig, limits)
+		queryCacheMiddleware, err := queryrange.NewResultsCacheMiddleware(log, cfg.ResultsCacheConfig, limits)
 		if err != nil {
 			return nil, err
 		}
-		ms = append(ms, queryrange.InstrumentMiddleware("results_cache", queryRangeDuration), queryCacheMiddleware)
+		queryRangeMiddleware = append(queryRangeMiddleware, queryrange.InstrumentMiddleware("results_cache", queryRangeDuration), queryCacheMiddleware)
 	}
 	if cfg.MaxRetries > 0 {
-		ms = append(ms, queryrange.InstrumentMiddleware("retry", queryRangeDuration), queryrange.NewRetryMiddleware(log, cfg.MaxRetries))
+		queryRangeMiddleware = append(queryRangeMiddleware, queryrange.InstrumentMiddleware("retry", queryRangeDuration), queryrange.NewRetryMiddleware(log, cfg.MaxRetries))
 	}
 
 	// Finally, if the user selected any query range middleware, stitch it in.
-	var rt http.RoundTripper = f
-	if len(ms) > 0 {
-		rt = queryrange.NewRoundTripper(
+	var roundTripper http.RoundTripper = f
+	if len(queryRangeMiddleware) > 0 {
+		roundTripper = queryrange.NewRoundTripper(
 			f,
-			queryrange.MergeMiddlewares(ms...).Wrap(&queryrange.ToRoundTripperMiddleware{Next: f}),
+			queryrange.MergeMiddlewares(queryRangeMiddleware...).Wrap(&queryrange.ToRoundTripperMiddleware{Next: f}),
 			limits,
 		)
 	}
-	f.roundTripper = rt
+	f.roundTripper = roundTripper
 	f.cond = sync.NewCond(&f.mtx)
 	return f, nil
 }

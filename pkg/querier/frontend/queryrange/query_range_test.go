@@ -59,7 +59,7 @@ func TestRequest(t *testing.T) {
 			ctx := user.InjectOrgID(context.Background(), "1")
 			r = r.WithContext(ctx)
 
-			req, err := ParseRequest(r)
+			req, err := parseRequest(r)
 			if err != nil {
 				require.EqualValues(t, tc.expectedErr, err)
 				return
