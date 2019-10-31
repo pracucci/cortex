@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -165,23 +166,35 @@ func TestWatchPrefix(t *testing.T) {
 			}
 		}
 
+		// start watching the prefix before starting the updaters
+		observedKeys := map[string]int{}
+		ctx, cfn := context.WithTimeout(context.Background(), 1.5*max*sleep)
+		defer cfn()
+
+		watchPrefixWg := sync.WaitGroup{}
+		watchPrefixWg.Add(1)
+
+		go func() {
+			defer watchPrefixWg.Done()
+
+			client.WatchPrefix(ctx, prefix, func(key string, val interface{}) bool {
+				observedKeys[key] = observedKeys[key] + 1
+				return true
+			})
+		}()
+
+		// start the updaters
 		ch1 := make(chan struct{})
 		ch2 := make(chan struct{})
 		go gen(prefix, ch1)
 		go gen(prefix2, ch2) // we don't want to see these keys reported
 
-		observedKeys := map[string]int{}
-		ctx, cfn := context.WithTimeout(context.Background(), 1.5*max*sleep)
-		defer cfn()
-
-		client.WatchPrefix(ctx, prefix, func(key string, val interface{}) bool {
-			observedKeys[key] = observedKeys[key] + 1
-			return true
-		})
-
-		// wait until updaters finish (should be done by now)
+		// wait until updaters finish
 		<-ch1
 		<-ch2
+
+		// wait until the WatchPrefix() returns
+		watchPrefixWg.Wait()
 
 		// verify that each key was reported once, and keys outside prefix were not reported
 		for i := 0; i < max; i++ {
