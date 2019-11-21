@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"io/ioutil"
 	"os"
 	"testing"
@@ -14,7 +15,7 @@ import (
 )
 
 // TODO remove me
-func TestBucketMapper_ManualTest(t *testing.T) {
+func TestBucketDiscovery_ManualTest(t *testing.T) {
 	serviceAccount, err := ioutil.ReadFile("/workspace/src/github.com/cortexproject/cortex/local/tsdb-gcs/service-account.json")
 	require.NoError(t, err)
 
@@ -27,14 +28,17 @@ func TestBucketMapper_ManualTest(t *testing.T) {
 	bucket, err := gcs.NewBucketClient(context.Background(), cfg, "test", logger)
 	require.NoError(t, err)
 
-	mint := toMillis(mustParseTime(time.RFC3339, "2019-11-10T03:15:00Z"))
-	maxt := toMillis(mustParseTime(time.RFC3339, "2019-11-10T03:15:00Z"))
-	m := NewBucketMapper(bucket, 24*time.Hour)
-	err = m.getMissingBlocks(context.Background(), mint, maxt)
+	mint := toMillis(mustParseTime(time.RFC3339, "2019-11-18T03:15:00Z"))
+	maxt := toMillis(mustParseTime(time.RFC3339, "2019-11-19T04:16:00Z"))
+
+	m := NewBucketDiscovery(bucket, 24*time.Hour, nil)
+	refs, err := m.GetBlocks(context.Background(), mint, maxt)
 	require.NoError(t, err)
+
+	fmt.Println(refs)
 }
 
-func TestBucketMapper_getMissingBlocksRequests(t *testing.T) {
+func TestBucketDiscovery_getMissingBlocksRequests(t *testing.T) {
 	t.Parallel()
 
 	tests := map[string]struct {
@@ -119,9 +123,9 @@ func TestBucketMapper_getMissingBlocksRequests(t *testing.T) {
 
 	for testName, testData := range tests {
 		t.Run(testName, func(t *testing.T) {
-			mapper := NewBucketMapper(nil, testData.maxBlockRange)
-			mapper.blocksRanges = testData.blocksRanges
-			actual := mapper.getMissingBlocksRequests(toMillis(testData.mint), toMillis(testData.maxt))
+			discovery := NewBucketDiscovery(nil, testData.maxBlockRange, nil)
+			discovery.blocksRanges = testData.blocksRanges
+			actual := discovery.getMissingBlocksRequests(toMillis(testData.mint), toMillis(testData.maxt))
 
 			assert.Equal(t, testData.expected, actual)
 		})

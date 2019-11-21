@@ -16,12 +16,12 @@ type TimeRange struct {
 
 // MinTime return mint as time.Time.
 func (t *TimeRange) MinTime() time.Time {
-	return time.Unix(t.mint/1000, t.mint%1000).UTC()
+	return time.Unix(0, t.mint*1000000).UTC()
 }
 
 // MaxTime return maxt as time.Time.
 func (t *TimeRange) MaxTime() time.Time {
-	return time.Unix(t.maxt/1000, t.maxt%1000).UTC()
+	return time.Unix(0, t.maxt*1000000).UTC()
 }
 
 // String returns an human readable representation of the time range.

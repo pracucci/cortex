@@ -2,6 +2,7 @@ package store
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -188,4 +189,12 @@ func TestTimeRanges_Normalize(t *testing.T) {
 			assert.Equal(t, testData.expected, actual)
 		})
 	}
+}
+
+func TestTimeRange_MinAndMaxTime(t *testing.T) {
+	ts := mustParseTime(time.RFC3339Nano, "2019-11-20T01:02:03.123000000Z")
+	r := TimeRange{toMillis(ts), toMillis(ts)}
+
+	assert.Equal(t, ts, r.MinTime())
+	assert.Equal(t, ts, r.MaxTime())
 }
