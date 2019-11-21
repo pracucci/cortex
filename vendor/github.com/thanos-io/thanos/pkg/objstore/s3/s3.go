@@ -229,7 +229,11 @@ func (b *Bucket) Iter(ctx context.Context, dir string, f func(string) error) err
 		dir = strings.TrimSuffix(dir, DirDelim) + DirDelim
 	}
 
-	for object := range b.client.ListObjects(b.name, dir, false, ctx.Done()) {
+	return b.IterPrefix(ctx, dir, f)
+}
+
+func (b *Bucket) IterPrefix(ctx context.Context, prefix string, f func(string) error) error {
+	for object := range b.client.ListObjects(b.name, prefix, false, ctx.Done()) {
 		// Catch the error when failed to list objects.
 		if object.Err != nil {
 			return object.Err
@@ -239,7 +243,7 @@ func (b *Bucket) Iter(ctx context.Context, dir string, f func(string) error) err
 			continue
 		}
 		// The s3 client can also return the directory itself in the ListObjects call above.
-		if object.Key == dir {
+		if object.Key == prefix {
 			continue
 		}
 		if err := f(object.Key); err != nil {
@@ -248,10 +252,6 @@ func (b *Bucket) Iter(ctx context.Context, dir string, f func(string) error) err
 	}
 
 	return nil
-}
-
-func (b *Bucket) IterPrefix(ctx context.Context, prefix string, f func(string) error) error {
-	return errors.New("not implemented")
 }
 
 func (b *Bucket) getRange(ctx context.Context, name string, off, length int64) (io.ReadCloser, error) {

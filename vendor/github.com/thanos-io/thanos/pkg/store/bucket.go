@@ -276,6 +276,18 @@ func NewBucketStore(
 		partitioner:              partitioner,
 		filterConfig:             filterConf,
 		enableCompatibilityLabel: enableCompatibilityLabel,
+		backend: NewBucketStoreLazyBackend(
+			logger,
+			reg,
+			bucket,
+			dir,
+			indexCache,
+			relabelConfig,
+			chunkPool,
+			partitioner,
+			24*time.Hour,
+		),
+		/*
 		backend: NewBucketStoreGreedyBackend(
 			logger,
 			reg,
@@ -288,6 +300,7 @@ func NewBucketStore(
 			filterConf,
 			partitioner,
 		),
+		*/
 	}
 	s.metrics = metrics
 
