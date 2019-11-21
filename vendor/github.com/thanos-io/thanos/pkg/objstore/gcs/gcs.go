@@ -91,8 +91,13 @@ func (b *Bucket) Iter(ctx context.Context, dir string, f func(string) error) err
 	if dir != "" {
 		dir = strings.TrimSuffix(dir, DirDelim) + DirDelim
 	}
+
+	return b.IterPrefix(ctx, dir, f)
+}
+
+func (b *Bucket) IterPrefix(ctx context.Context, prefix string, f func(string) error) error {
 	it := b.bkt.Objects(ctx, &storage.Query{
-		Prefix:    dir,
+		Prefix:    prefix,
 		Delimiter: DirDelim,
 	})
 	for {

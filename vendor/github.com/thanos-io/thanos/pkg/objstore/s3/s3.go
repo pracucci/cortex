@@ -250,6 +250,10 @@ func (b *Bucket) Iter(ctx context.Context, dir string, f func(string) error) err
 	return nil
 }
 
+func (b *Bucket) IterPrefix(ctx context.Context, prefix string, f func(string) error) error {
+	return errors.New("not implemented")
+}
+
 func (b *Bucket) getRange(ctx context.Context, name string, off, length int64) (io.ReadCloser, error) {
 	opts := &minio.GetObjectOptions{ServerSideEncryption: b.sse}
 	if length != -1 {

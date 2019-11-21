@@ -39,6 +39,8 @@ type BucketReader interface {
 	// object name including the prefix of the inspected directory.
 	Iter(ctx context.Context, dir string, f func(string) error) error
 
+	IterPrefix(ctx context.Context, prefix string, f func(string) error) error
+
 	// Get returns a reader for the given object name.
 	Get(ctx context.Context, name string) (io.ReadCloser, error)
 
@@ -227,6 +229,18 @@ func (b *metricBucket) Iter(ctx context.Context, dir string, f func(name string)
 	const op = "iter"
 
 	err := b.bkt.Iter(ctx, dir, f)
+	if err != nil {
+		b.opsFailures.WithLabelValues(op).Inc()
+	}
+	b.ops.WithLabelValues(op).Inc()
+
+	return err
+}
+
+func (b *metricBucket) IterPrefix(ctx context.Context, prefix string, f func(name string) error) error {
+	const op = "iterprefix"
+
+	err := b.bkt.IterPrefix(ctx, prefix, f)
 	if err != nil {
 		b.opsFailures.WithLabelValues(op).Inc()
 	}
