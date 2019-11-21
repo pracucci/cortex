@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -21,7 +20,6 @@ import (
 	"github.com/prometheus/prometheus/pkg/relabel"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
-	"github.com/prometheus/prometheus/tsdb/fileutil"
 	"github.com/prometheus/prometheus/tsdb/index"
 	"github.com/prometheus/prometheus/tsdb/labels"
 	"github.com/thanos-io/thanos/pkg/block"
@@ -213,8 +211,6 @@ type BucketStore struct {
 
 	// Verbose enabled additional logging.
 	debugLogging bool
-	// Number of goroutines to use when syncing blocks from object storage.
-	blockSyncConcurrency int
 
 	// Query gate which limits the maximum amount of concurrent queries.
 	queryGate *Gate
@@ -223,13 +219,11 @@ type BucketStore struct {
 	samplesLimiter *Limiter
 	partitioner    partitioner
 
-	filterConfig  *FilterConfig
+	filterConfig *FilterConfig
 
-	labelSetsMtx sync.RWMutex
-	labelSets                map[uint64]labels.Labels
 	enableCompatibilityLabel bool
 
-	blocks *bucketBlocks
+	backend BucketStoreBackend
 }
 
 // NewBucketStore creates a new bucket backed store that implements the store API against
@@ -266,25 +260,14 @@ func NewBucketStore(
 
 	partitioner := gapBasedPartitioner{maxGapSize: maxGapSize}
 
-	blocks := newBucketBlocks(
-		logger,
-		reg,
-		bucket,
-		dir,
-		indexCache,
-		chunkPool,
-		partitioner,
-		relabelConfig)
-
 	metrics := newBucketStoreMetrics(reg)
 	s := &BucketStore{
-		logger:               logger,
-		bucket:               bucket,
-		dir:                  dir,
-		indexCache:           indexCache,
-		chunkPool:            chunkPool,
-		debugLogging:         debugLogging,
-		blockSyncConcurrency: blockSyncConcurrency,
+		logger:       logger,
+		bucket:       bucket,
+		dir:          dir,
+		indexCache:   indexCache,
+		chunkPool:    chunkPool,
+		debugLogging: debugLogging,
 		queryGate: NewGate(
 			maxConcurrent,
 			extprom.WrapRegistererWithPrefix("thanos_bucket_store_series_", reg),
@@ -293,7 +276,18 @@ func NewBucketStore(
 		partitioner:              partitioner,
 		filterConfig:             filterConf,
 		enableCompatibilityLabel: enableCompatibilityLabel,
-		blocks:                   blocks,
+		backend: NewBucketStoreGreedyBackend(
+			logger,
+			reg,
+			bucket,
+			dir,
+			indexCache,
+			blockSyncConcurrency,
+			relabelConfig,
+			chunkPool,
+			filterConf,
+			partitioner,
+		),
 	}
 	s.metrics = metrics
 
@@ -306,134 +300,26 @@ func NewBucketStore(
 	return s, nil
 }
 
+func (b *BucketStore) InitialSync(ctx context.Context) error {
+	return b.backend.InitialSync(ctx)
+}
+
+func (b *BucketStore) SyncBlocks(ctx context.Context) error {
+	return b.backend.SyncBlocks(ctx)
+}
+
 // Close the store.
 func (s *BucketStore) Close() (err error) {
-	return s.blocks.close()
-}
-
-// SyncBlocks synchronizes the stores state with the Bucket bucket.
-// It will reuse disk space as persistent cache based on s.dir param.
-func (s *BucketStore) SyncBlocks(ctx context.Context) error {
-	var wg sync.WaitGroup
-	blockc := make(chan ulid.ULID)
-
-	for i := 0; i < s.blockSyncConcurrency; i++ {
-		wg.Add(1)
-		go func() {
-			for id := range blockc {
-				if err := s.blocks.addBlock(ctx, id); err != nil {
-					level.Warn(s.logger).Log("msg", "loading block failed", "id", id, "err", err)
-					continue
-				}
-			}
-			wg.Done()
-		}()
-	}
-
-	allIDs := map[ulid.ULID]struct{}{}
-
-	err := s.bucket.Iter(ctx, "", func(name string) error {
-		// Strip trailing slash indicating a directory.
-		id, err := ulid.Parse(name[:len(name)-1])
-		if err != nil {
-			return nil
-		}
-
-		inRange, err := s.isBlockInMinMaxRange(ctx, id)
-		if err != nil {
-			level.Warn(s.logger).Log("msg", "error parsing block range", "block", id, "err", err)
-			return nil
-		}
-
-		if !inRange {
-			return nil
-		}
-
-		allIDs[id] = struct{}{}
-
-		if b := s.blocks.getBlock(id); b != nil {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-		case blockc <- id:
-		}
-		return nil
-	})
-
-	close(blockc)
-	wg.Wait()
-
-	if err != nil {
-		return errors.Wrap(err, "iter")
-	}
-	// Drop all blocks that are no longer present in the bucket.
-	s.blocks.removeBlocksExcept(allIDs)
-
-	// Sync advertise labels.
-	s.labelSetsMtx.Lock()
-	s.labelSets = s.blocks.labelSets()
-	s.labelSetsMtx.Unlock()
-
-	return nil
-}
-
-// InitialSync perform blocking sync with extra step at the end to delete locally saved blocks that are no longer
-// present in the bucket. The mismatch of these can only happen between restarts, so we can do that only once per startup.
-func (s *BucketStore) InitialSync(ctx context.Context) error {
-	if err := s.SyncBlocks(ctx); err != nil {
-		return errors.Wrap(err, "sync block")
-	}
-
-	names, err := fileutil.ReadDir(s.dir)
-	if err != nil {
-		return errors.Wrap(err, "read dir")
-	}
-	for _, n := range names {
-		id, ok := block.IsBlockDir(n)
-		if !ok {
-			continue
-		}
-		if b := s.blocks.getBlock(id); b != nil {
-			continue
-		}
-
-		// No such block loaded, remove the local dir.
-		if err := os.RemoveAll(path.Join(s.dir, id.String())); err != nil {
-			level.Warn(s.logger).Log("msg", "failed to remove block which is not needed", "err", err)
-		}
-	}
-
-	return nil
+	return s.backend.Close()
 }
 
 func (s *BucketStore) numBlocks() int {
-	return s.blocks.numBlocks()
-}
-
-func (s *BucketStore) isBlockInMinMaxRange(ctx context.Context, id ulid.ULID) (bool, error) {
-	dir := filepath.Join(s.dir, id.String())
-
-	err, meta := loadMeta(ctx, s.logger, s.bucket, dir, id)
-	if err != nil {
-		return false, err
-	}
-
-	// We check for blocks in configured minTime, maxTime range.
-	switch {
-	case meta.MaxTime <= s.filterConfig.MinTime.PrometheusTimestamp():
-		return false, nil
-
-	case meta.MinTime >= s.filterConfig.MaxTime.PrometheusTimestamp():
-		return false, nil
-	}
-
-	return true, nil
+	return s.backend.NumBlocks()
 }
 
 // TimeRange returns the minimum and maximum timestamp of data available in the store.
 func (s *BucketStore) TimeRange() (mint, maxt int64) {
-	mint, maxt = s.blocks.timeRange()
+	mint, maxt = s.backend.TimeRange()
 
 	mint = s.limitMinTime(mint)
 	maxt = s.limitMaxTime(maxt)
@@ -448,18 +334,8 @@ func (s *BucketStore) Info(context.Context, *storepb.InfoRequest) (*storepb.Info
 		StoreType: component.Store.ToProto(),
 		MinTime:   mint,
 		MaxTime:   maxt,
+		LabelSets: s.backend.LabelSets(),
 	}
-
-	s.labelSetsMtx.RLock()
-	res.LabelSets = make([]storepb.LabelSet, 0, len(s.labelSets))
-	for _, ls := range s.labelSets {
-		lset := make([]storepb.Label, 0, len(ls))
-		for _, l := range ls {
-			lset = append(lset, storepb.Label{Name: l.Name, Value: l.Value})
-		}
-		res.LabelSets = append(res.LabelSets, storepb.LabelSet{Labels: lset})
-	}
-	s.labelSetsMtx.RUnlock()
 
 	if s.enableCompatibilityLabel && len(res.LabelSets) > 0 {
 		// This is for compatibility with Querier v0.7.0.
@@ -739,7 +615,12 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, srv storepb.Store_Serie
 		mtx   sync.Mutex
 	)
 
-	for _, set := range s.blocks.getBlocksFor(matchers, req.MinTime, req.MaxTime, req.MaxResolutionWindow) {
+	blockSets, err := s.backend.GetBlocksFor(srv.Context(), matchers, req.MinTime, req.MaxTime, req.MaxResolutionWindow)
+	if err != nil {
+		return status.Error(codes.Unavailable, err.Error())
+	}
+
+	for _, set := range blockSets {
 		for _, b := range set.blocks {
 			stats.blocksQueried++
 
@@ -862,7 +743,7 @@ func (s *BucketStore) LabelNames(ctx context.Context, _ *storepb.LabelNamesReque
 	var mtx sync.Mutex
 	var sets [][]string
 
-	for _, indexr := range s.blocks.indexReaderForAllBlocks(gctx) {
+	for _, indexr := range s.backend.IndexReaderForAllBlocks(gctx) {
 		g.Go(func() error {
 			defer runutil.CloseWithLogOnErr(s.logger, indexr, "label names")
 
@@ -892,7 +773,7 @@ func (s *BucketStore) LabelValues(ctx context.Context, req *storepb.LabelValuesR
 	var mtx sync.Mutex
 	var sets [][]string
 
-	for _, indexr := range s.blocks.indexReaderForAllBlocks(gctx) {
+	for _, indexr := range s.backend.IndexReaderForAllBlocks(gctx) {
 		// TODO(fabxc): only aggregate chunk metas first and add a subsequent fetch stage
 		// where we consolidate requests.
 		g.Go(func() error {
