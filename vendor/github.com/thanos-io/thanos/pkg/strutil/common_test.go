@@ -1,4 +1,5 @@
-package util
+package strutil
+
 
 import "testing"
 

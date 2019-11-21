@@ -1,4 +1,4 @@
-package util
+package strutil
 
 // CommonPrefix returns the longest common prefix between the two input strings.
 func CommonPrefix(first, second string) string {

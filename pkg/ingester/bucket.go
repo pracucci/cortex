@@ -47,6 +47,16 @@ func (b *Bucket) Iter(ctx context.Context, dir string, f func(string) error) err
 	})
 }
 
+func (b *Bucket) IterPrefix(ctx context.Context, prefix string, f func(string) error) error {
+	return b.Bucket.IterPrefix(ctx, b.fullName(prefix), func(s string) error {
+		/*
+			Since all objects are prefixed with the userID we need to strip the userID
+			upon passing to the processing function
+		*/
+		return f(strings.Join(strings.Split(s, "/")[1:], "/"))
+	})
+}
+
 // Get returns a reader for the given object name.
 func (b *Bucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
 	return b.Bucket.Get(ctx, b.fullName(name))

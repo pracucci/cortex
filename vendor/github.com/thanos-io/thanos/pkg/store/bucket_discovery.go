@@ -6,12 +6,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cortexproject/cortex/pkg/storage/tsdb/util"
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
 	"github.com/thanos-io/thanos/pkg/objstore"
+	"github.com/thanos-io/thanos/pkg/strutil"
 )
 
 var (
@@ -178,7 +178,7 @@ func (d *BucketDiscovery) getMissingBlocksRequests(mint, maxt int64) []blocksLis
 		// Look for the longest common prefix between the mint and maxt
 		minTimestamp := r.MinTime().Format(time.RFC3339Nano)
 		maxTimestamp := r.MaxTime().Format(time.RFC3339Nano)
-		prefixTimestamp := util.CommonPrefix(minTimestamp, maxTimestamp)
+		prefixTimestamp := strutil.CommonPrefix(minTimestamp, maxTimestamp)
 
 		// Given the constructed prefix may be larger then the requested range,
 		// we have to rebuild the actual time range

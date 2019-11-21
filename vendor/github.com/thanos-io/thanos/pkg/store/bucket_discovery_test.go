@@ -8,35 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cortexproject/cortex/pkg/storage/tsdb/backend/gcs"
 	"github.com/go-kit/kit/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-// TODO remove me
-func TestBucketDiscovery_ManualTest(t *testing.T) {
-	serviceAccount, err := ioutil.ReadFile("/workspace/src/github.com/cortexproject/cortex/local/tsdb-gcs/service-account.json")
-	require.NoError(t, err)
-
-	cfg := gcs.Config{
-		BucketName:     "cortex-tsdb.pracucci.com",
-		ServiceAccount: string(serviceAccount),
-	}
-
-	logger := log.NewLogfmtLogger(os.Stdout)
-	bucket, err := gcs.NewBucketClient(context.Background(), cfg, "test", logger)
-	require.NoError(t, err)
-
-	mint := toMillis(mustParseTime(time.RFC3339, "2019-11-18T03:15:00Z"))
-	maxt := toMillis(mustParseTime(time.RFC3339, "2019-11-19T04:16:00Z"))
-
-	m := NewBucketDiscovery(bucket, 24*time.Hour, nil)
-	refs, err := m.GetBlocks(context.Background(), mint, maxt)
-	require.NoError(t, err)
-
-	fmt.Println(refs)
-}
 
 func TestBucketDiscovery_getMissingBlocksRequests(t *testing.T) {
 	t.Parallel()
