@@ -413,8 +413,7 @@ func TestIngester_v2Query_ShouldNotCreateTSDBIfDoesNotExists(t *testing.T) {
 	assert.Equal(t, &client.QueryResponse{}, res)
 
 	// Check if the TSDB has been created
-	_, tsdbCreated := i.TSDBState.dbs[userID]
-	assert.False(t, tsdbCreated)
+	assert.Nil(t, i.TSDBState.dbs.getUserTSDB(userID))
 }
 
 func TestIngester_v2LabelValues_ShouldNotCreateTSDBIfDoesNotExists(t *testing.T) {
@@ -433,8 +432,7 @@ func TestIngester_v2LabelValues_ShouldNotCreateTSDBIfDoesNotExists(t *testing.T)
 	assert.Equal(t, &client.LabelValuesResponse{}, res)
 
 	// Check if the TSDB has been created
-	_, tsdbCreated := i.TSDBState.dbs[userID]
-	assert.False(t, tsdbCreated)
+	assert.Nil(t, i.TSDBState.dbs.getUserTSDB(userID))
 }
 
 func TestIngester_v2LabelNames_ShouldNotCreateTSDBIfDoesNotExists(t *testing.T) {
@@ -453,8 +451,7 @@ func TestIngester_v2LabelNames_ShouldNotCreateTSDBIfDoesNotExists(t *testing.T) 
 	assert.Equal(t, &client.LabelNamesResponse{}, res)
 
 	// Check if the TSDB has been created
-	_, tsdbCreated := i.TSDBState.dbs[userID]
-	assert.False(t, tsdbCreated)
+	assert.Nil(t, i.TSDBState.dbs.getUserTSDB(userID))
 }
 
 func TestIngester_v2Push_ShouldNotCreateTSDBIfNotInActiveState(t *testing.T) {
@@ -474,8 +471,7 @@ func TestIngester_v2Push_ShouldNotCreateTSDBIfNotInActiveState(t *testing.T) {
 	assert.Nil(t, res)
 
 	// Check if the TSDB has been created
-	_, tsdbCreated := i.TSDBState.dbs[userID]
-	assert.False(t, tsdbCreated)
+	assert.Nil(t, i.TSDBState.dbs.getUserTSDB(userID))
 }
 
 func TestIngester_getOrCreateTSDB_ShouldNotAllowToCreateTSDBIfIngesterStateIsNotActive(t *testing.T) {

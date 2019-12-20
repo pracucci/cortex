@@ -14,11 +14,6 @@ import (
 	"github.com/go-kit/kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/tsdb"
-	lbls "github.com/prometheus/prometheus/tsdb/labels"
-	"github.com/thanos-io/thanos/pkg/block/metadata"
-	"github.com/thanos-io/thanos/pkg/objstore"
-	"github.com/thanos-io/thanos/pkg/runutil"
-	"github.com/thanos-io/thanos/pkg/shipper"
 	"github.com/weaveworks/common/httpgrpc"
 	"github.com/weaveworks/common/user"
 	"golang.org/x/net/context"
@@ -31,8 +26,7 @@ const (
 
 // TSDBState holds data structures used by the TSDB storage engine
 type TSDBState struct {
-	dbs    map[string]*tsdb.DB // tsdb sharded by userID
-	bucket objstore.Bucket
+	dbs *usersDB
 
 	// Keeps count of in-flight requests
 	inflightWriteReqs sync.WaitGroup
@@ -58,8 +52,7 @@ func NewV2(cfg Config, clientConfig client.Config, limits *validation.Overrides,
 		quit:         make(chan struct{}),
 
 		TSDBState: TSDBState{
-			dbs:    make(map[string]*tsdb.DB),
-			bucket: bucketClient,
+			dbs: newUsersDB(bucketClient),
 		},
 	}
 
@@ -178,7 +171,7 @@ func (i *Ingester) v2Query(ctx old_ctx.Context, req *client.QueryRequest) (*clie
 
 	i.metrics.queries.Inc()
 
-	db := i.getTSDB(userID)
+	db := i.TSDBState.dbs.getUserTSDB(userID)
 	if db == nil {
 		return &client.QueryResponse{}, nil
 	}
@@ -225,7 +218,7 @@ func (i *Ingester) v2LabelValues(ctx old_ctx.Context, req *client.LabelValuesReq
 		return nil, err
 	}
 
-	db := i.getTSDB(userID)
+	db := i.TSDBState.dbs.getUserTSDB(userID)
 	if db == nil {
 		return &client.LabelValuesResponse{}, nil
 	}
@@ -254,7 +247,7 @@ func (i *Ingester) v2LabelNames(ctx old_ctx.Context, req *client.LabelNamesReque
 		return nil, err
 	}
 
-	db := i.getTSDB(userID)
+	db := i.TSDBState.dbs.getUserTSDB(userID)
 	if db == nil {
 		return &client.LabelNamesResponse{}, nil
 	}
@@ -283,7 +276,7 @@ func (i *Ingester) v2MetricsForLabelMatchers(ctx old_ctx.Context, req *client.Me
 		return nil, err
 	}
 
-	db := i.getTSDB(userID)
+	db := i.TSDBState.dbs.getUserTSDB(userID)
 	if db == nil {
 		return &client.MetricsForLabelMatchersResponse{}, nil
 	}
@@ -349,26 +342,9 @@ func (i *Ingester) v2MetricsForLabelMatchers(ctx old_ctx.Context, req *client.Me
 	return result, nil
 }
 
-func (i *Ingester) getTSDB(userID string) *tsdb.DB {
-	i.userStatesMtx.RLock()
-	defer i.userStatesMtx.RUnlock()
-	db, _ := i.TSDBState.dbs[userID]
-	return db
-}
-
 func (i *Ingester) getOrCreateTSDB(userID string, force bool) (*tsdb.DB, error) {
-	db := i.getTSDB(userID)
+	db := i.TSDBState.dbs.getUserTSDB(userID)
 	if db != nil {
-		return db, nil
-	}
-
-	i.userStatesMtx.Lock()
-	defer i.userStatesMtx.Unlock()
-
-	// Check again for DB in the event it was created in-between locks
-	var ok bool
-	db, ok = i.TSDBState.dbs[userID]
-	if ok {
 		return db, nil
 	}
 
@@ -382,76 +358,5 @@ func (i *Ingester) getOrCreateTSDB(userID string, force bool) (*tsdb.DB, error) 
 		return nil, fmt.Errorf(errTSDBCreateIncompatibleState, ingesterState)
 	}
 
-	udir := i.cfg.TSDBConfig.BlocksDir(userID)
-
-	// Create a new user database
-	var err error
-	db, err = tsdb.Open(udir, util.Logger, nil, &tsdb.Options{
-		RetentionDuration: uint64(i.cfg.TSDBConfig.Retention / time.Millisecond),
-		BlockRanges:       i.cfg.TSDBConfig.BlockRanges.ToMillisecondRanges(),
-		NoLockfile:        true,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	// Thanos shipper requires at least 1 external label to be set. For this reason,
-	// we set the tenant ID as external label and we'll filter it out when reading
-	// the series from the storage.
-	l := lbls.Labels{
-		{
-			Name:  cortex_tsdb.TenantIDExternalLabel,
-			Value: userID,
-		},
-	}
-
-	// Create a new shipper for this database
-	s := shipper.New(util.Logger, nil, udir, &Bucket{userID, i.TSDBState.bucket}, func() lbls.Labels { return l }, metadata.ReceiveSource)
-	i.done.Add(1)
-	go func() {
-		defer i.done.Done()
-		runutil.Repeat(i.cfg.TSDBConfig.ShipInterval, i.quit, func() error {
-			if uploaded, err := s.Sync(context.Background()); err != nil {
-				level.Warn(util.Logger).Log("err", err, "uploaded", uploaded)
-			}
-			return nil
-		})
-	}()
-
-	i.TSDBState.dbs[userID] = db
-
-	return db, nil
-}
-
-func (i *Ingester) closeAllTSDB() {
-	i.userStatesMtx.Lock()
-
-	wg := &sync.WaitGroup{}
-	wg.Add(len(i.TSDBState.dbs))
-
-	// Concurrently close all users TSDB
-	for userID, db := range i.TSDBState.dbs {
-		userID := userID
-
-		go func(db *tsdb.DB) {
-			defer wg.Done()
-
-			if err := db.Close(); err != nil {
-				level.Warn(util.Logger).Log("msg", "unable to close TSDB", "err", err, "user", userID)
-				return
-			}
-
-			// Now that the TSDB has been closed, we should remove it from the
-			// set of open ones. This lock acquisition doesn't deadlock with the
-			// outer one, because the outer one is released as soon as all go
-			// routines are started.
-			i.userStatesMtx.Lock()
-			delete(i.TSDBState.dbs, userID)
-			i.userStatesMtx.Unlock()
-		}(db)
-	}
-
-	// Wait until all Close() completed
-	i.userStatesMtx.Unlock()
-	wg.Wait()
+	return i.TSDBState.dbs.createUserTSDB(userID, i.cfg.TSDBConfig)
 }

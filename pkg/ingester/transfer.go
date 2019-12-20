@@ -8,7 +8,6 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
 
 	"github.com/go-kit/kit/log/level"
@@ -16,7 +15,6 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/tsdb"
 	"github.com/thanos-io/thanos/pkg/shipper"
 
 	"github.com/cortexproject/cortex/pkg/chunk/encoding"
@@ -501,11 +499,7 @@ func (i *Ingester) transferOut(ctx context.Context) error {
 
 func (i *Ingester) v2TransferOut(ctx context.Context) error {
 	// Skip TSDB transfer if there are no DBs
-	i.userStatesMtx.RLock()
-	skip := len(i.TSDBState.dbs) == 0
-	i.userStatesMtx.RUnlock()
-
-	if skip {
+	if i.TSDBState.dbs.empty() {
 		level.Info(util.Logger).Log("msg", "the ingester has nothing to transfer")
 		return nil
 	}
@@ -535,20 +529,7 @@ func (i *Ingester) v2TransferOut(ctx context.Context) error {
 		// If there's an on-going compaction, the DisableCompactions() will wait until
 		// completed.
 		level.Info(util.Logger).Log("msg", "disabling compaction on all TSDBs")
-
-		i.userStatesMtx.RLock()
-		wg := &sync.WaitGroup{}
-		wg.Add(len(i.TSDBState.dbs))
-
-		for _, db := range i.TSDBState.dbs {
-			go func(db *tsdb.DB) {
-				defer wg.Done()
-				db.DisableCompactions()
-			}(db)
-		}
-
-		i.userStatesMtx.RUnlock()
-		wg.Wait()
+		i.TSDBState.dbs.disableCompactions()
 	})
 
 	// Look for a joining ingester to transfer blocks and WAL to
@@ -590,7 +571,7 @@ func (i *Ingester) v2TransferOut(ctx context.Context) error {
 	// The transfer out has been successfully completed. Now we should close
 	// all open TSDBs: the Close() will wait until all on-going read operations
 	// will be completed.
-	i.closeAllTSDB()
+	i.TSDBState.dbs.close()
 
 	return nil
 }
