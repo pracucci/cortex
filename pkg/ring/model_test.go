@@ -132,3 +132,76 @@ func TestReady(t *testing.T) {
 		t.Fatal("expected ready, got", err)
 	}
 }
+
+func TestRingTokens_GetOwner(t *testing.T) {
+	tests := map[string]struct {
+		tokens      RingTokens
+		key         uint32
+		expectedID  string
+		expectedErr error
+	}{
+		"empty ring": {
+			tokens:      RingTokens{},
+			expectedErr: errEmptyRing,
+		},
+		"single instance, single token": {
+			tokens: RingTokens{
+				{Ingester: "A", Token: 3},
+			},
+			key:        2,
+			expectedID: "A",
+		},
+		"single instance, multiple tokens": {
+			tokens: RingTokens{
+				{Ingester: "A", Token: 3},
+				{Ingester: "A", Token: 7},
+			},
+			key:        5,
+			expectedID: "A",
+		},
+		"multiple instances, key matching a token": {
+			tokens: RingTokens{
+				{Ingester: "A", Token: 3},
+				{Ingester: "B", Token: 5},
+				{Ingester: "C", Token: 8},
+			},
+			key:        5,
+			expectedID: "B",
+		},
+		"multiple instances, key between two tokens": {
+			tokens: RingTokens{
+				{Ingester: "A", Token: 3},
+				{Ingester: "B", Token: 5},
+				{Ingester: "C", Token: 8},
+			},
+			key:        6,
+			expectedID: "C",
+		},
+		"multiple instances, key lower than the smallest token": {
+			tokens: RingTokens{
+				{Ingester: "A", Token: 3},
+				{Ingester: "B", Token: 5},
+				{Ingester: "C", Token: 8},
+			},
+			key:        1,
+			expectedID: "A",
+		},
+		"multiple instances, key greater than the largest token": {
+			tokens: RingTokens{
+				{Ingester: "A", Token: 3},
+				{Ingester: "B", Token: 5},
+				{Ingester: "C", Token: 8},
+			},
+			key:        9,
+			expectedID: "A",
+		},
+	}
+
+	for testName, testData := range tests {
+		t.Run(testName, func(t *testing.T) {
+			actualID, actualErr := testData.tokens.GetOwner(testData.key)
+			assert.Equal(t, testData.expectedID, actualID)
+			assert.Equal(t, testData.expectedErr, actualErr)
+		})
+	}
+}

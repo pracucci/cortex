@@ -1,6 +1,7 @@
 package cortex
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -29,7 +30,9 @@ import (
 	"github.com/cortexproject/cortex/pkg/ring/kv/codec"
 	"github.com/cortexproject/cortex/pkg/ring/kv/memberlist"
 	"github.com/cortexproject/cortex/pkg/ruler"
+	cortex_tsdb "github.com/cortexproject/cortex/pkg/storage/tsdb"
 	"github.com/cortexproject/cortex/pkg/storegateway"
+	"github.com/cortexproject/cortex/pkg/storegateway/storegatewaypb"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/runtimeconfig"
 	"github.com/cortexproject/cortex/pkg/util/services"
@@ -215,11 +218,42 @@ func (t *Cortex) initStoreQueryable(cfg *Config) (services.Service, error) {
 	}
 
 	if cfg.Storage.Engine == storage.StorageEngineTSDB {
-		storeQueryable, err := querier.NewBlockQueryable(cfg.TSDB, cfg.Server.LogLevel, prometheus.DefaultRegisterer)
+		// TODO initialising everything here temporarily until I finalise the design
+
+		storesRing, err := ring.New(cfg.StoreGateway.ShardingRing.ToRingConfig(), storegateway.RingName, storegateway.RingKey)
 		if err != nil {
 			return nil, err
 		}
+
+		// TODO not the right place, it's just a bad hack
+		if err = services.StartAndAwaitRunning(context.Background(), storesRing); err != nil {
+			return nil, err
+		}
+
+		bucketClient, err := cortex_tsdb.NewBucketClient(context.Background(), cfg.TSDB, "querier", util.Logger)
+		if err != nil {
+			return nil, err
+		}
+
+		scannerCfg := querier.BlocksScannerConfig{
+			ScanInterval:             cfg.TSDB.BucketStore.SyncInterval,
+			TenantsConcurrency:       cfg.TSDB.BucketStore.TenantSyncConcurrency,
+			MetasConcurrency:         cfg.TSDB.BucketStore.BlockSyncConcurrency,
+			CacheDir:                 cfg.TSDB.BucketStore.SyncDir,
+			ConsistencyDelay:         cfg.TSDB.BucketStore.ConsistencyDelay,
+			IgnoreDeletionMarksDelay: cfg.TSDB.BucketStore.IgnoreDeletionMarksDelay,
+		}
+
+		stores := querier.NewBlocksShardedStoreSet(storesRing, util.Logger, prometheus.DefaultRegisterer)
+		scanner := querier.NewBlocksScanner(scannerCfg, bucketClient, util.Logger, prometheus.DefaultRegisterer)
+
+		storeQueryable, err := querier.NewBlocksStoreQueryable(stores, scanner)
+		if err != nil {
+			return nil, err
+		}
+
 		t.storeQueryable = storeQueryable
+
 		return storeQueryable, nil
 	}
 
@@ -453,7 +487,12 @@ func (t *Cortex) initStoreGateway(cfg *Config) (serv services.Service, err error
 	cfg.StoreGateway.ShardingRing.ListenPort = cfg.Server.GRPCListenPort
 	cfg.StoreGateway.ShardingRing.KVStore.MemberlistKV = t.memberlistKV.GetMemberlistKV
 
-	t.storeGateway = storegateway.NewStoreGateway(cfg.StoreGateway, cfg.TSDB, util.Logger, prometheus.DefaultRegisterer)
+	t.storeGateway, err = storegateway.NewStoreGateway(cfg.StoreGateway, cfg.TSDB, cfg.Server.LogLevel, util.Logger, prometheus.DefaultRegisterer)
+	if err != nil {
+		return
+	}
+
+	storegatewaypb.RegisterStoreGatewayServer(t.server.GRPC, t.storeGateway)
 
 	// Expose HTTP endpoints.
 	t.api.RegisterStoreGateway(t.storeGateway)

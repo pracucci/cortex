@@ -133,6 +133,12 @@ func (i *IngesterDesc) IsHealthy(op Operation, heartbeatTimeout time.Duration) b
 
 	case Reporting:
 		healthy = true
+
+	case BlocksSync:
+		healthy = (i.State == JOINING) || (i.State == ACTIVE)
+
+	case BlocksQuery:
+		healthy = i.State == ACTIVE
 	}
 
 	return healthy && time.Since(time.Unix(i.Timestamp, 0)) <= heartbeatTimeout
@@ -399,9 +405,66 @@ func (d *Desc) getTokens() []TokenDesc {
 	return tokens
 }
 
-func getOrCreateRingDesc(d interface{}) *Desc {
+func GetOrCreateRingDesc(d interface{}) *Desc {
 	if d == nil {
 		return NewDesc()
 	}
 	return d.(*Desc)
+}
+
+func (d *Desc) getTokensForOperation(op Operation, heartbeatTimeout time.Duration) []TokenDesc {
+	var tokens []TokenDesc
+
+	for key, ing := range d.Ingesters {
+		// We assume all instances have the same number of tokens
+		// and all instances are healthy.
+		if tokens == nil {
+			tokens = make([]TokenDesc, 0, len(d.Ingesters)*len(ing.Tokens))
+		}
+
+		// Skip the instance if unhealthy.
+		if !ing.IsHealthy(op, heartbeatTimeout) {
+			continue
+		}
+
+		for _, token := range ing.Tokens {
+			tokens = append(tokens, TokenDesc{Token: token, Ingester: key})
+		}
+	}
+
+	sort.Sort(ByToken(tokens))
+	return tokens
+}
+
+type RingTokens []TokenDesc
+
+// GetOwner returns the instance ID owning the input key.
+func (t RingTokens) GetOwner(key uint32) (string, error) {
+	if len(t) == 0 {
+		return "", ErrEmptyRing
+	}
+
+	idx := sort.Search(len(t), func(idx int) bool {
+		return t[idx].Token >= key
+	})
+
+	if idx < len(t) {
+		return t[idx].Ingester, nil
+	} else {
+		return t[0].Ingester, nil
+	}
+}
+
+func (t RingTokens) Equals(other RingTokens) bool {
+	if len(t) != len(other) {
+		return false
+	}
+
+	for i := 0; i < len(t); i++ {
+		if (t[i].Token != other[i].Token) || (t[i].Ingester != other[i].Ingester) {
+			return false
+		}
+	}
+
+	return true
 }

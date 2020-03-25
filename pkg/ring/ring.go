@@ -34,9 +34,6 @@ const (
 
 	// CompactorRingKey is the key under which we store the compactors ring in the KVStore.
 	CompactorRingKey = "compactor"
-
-	// StoreGatewayRingKey is the key under which we store the store gateways ring in the KVStore.
-	StoreGatewayRingKey = "store-gateway"
 )
 
 // ReadRing represents the read interface to the ring.
@@ -61,10 +58,22 @@ const (
 	Read Operation = iota
 	Write
 	Reporting // Special value for inquiring about health
+
+	// BlocksSync is the operation run by the store-gateway to sync blocks.
+	BlocksSync
+
+	// BlocksQuery is the operation run by the querier to query blocks via the store-gateway.
+	BlocksQuery
 )
 
-// ErrEmptyRing is the error returned when trying to get an element when nothing has been added to hash.
-var ErrEmptyRing = errors.New("empty ring")
+var (
+	// ErrEmptyRing is the error returned when trying to get an element when nothing has been added to hash.
+	ErrEmptyRing = errors.New("empty ring")
+
+	// ErrInstanceNotFound is the error returned when trying to get information for an instance
+	// not registered within the ring.
+	ErrInstanceNotFound = errors.New("instance not found in the ring")
+)
 
 // Config for a Ring
 type Config struct {
@@ -108,13 +117,18 @@ type Ring struct {
 
 // New creates a new Ring. Being a service, Ring needs to be started to do anything.
 func New(cfg Config, name, key string) (*Ring, error) {
-	if cfg.ReplicationFactor <= 0 {
-		return nil, fmt.Errorf("ReplicationFactor must be greater than zero: %d", cfg.ReplicationFactor)
-	}
 	codec := GetCodec()
 	store, err := kv.NewClient(cfg.KVStore, codec)
 	if err != nil {
 		return nil, err
+	}
+
+	return NewWithStoreClient(cfg, name, key, store)
+}
+
+func NewWithStoreClient(cfg Config, name, key string, store kv.Client) (*Ring, error) {
+	if cfg.ReplicationFactor <= 0 {
+		return nil, fmt.Errorf("ReplicationFactor must be greater than zero: %d", cfg.ReplicationFactor)
 	}
 
 	r := &Ring{
@@ -262,6 +276,15 @@ func (r *Ring) GetAll() (ReplicationSet, error) {
 		Ingesters: ingesters,
 		MaxErrors: maxErrors,
 	}, nil
+}
+
+// GetOwnedTokens returns all the tokens owned by healthy instances for
+// the given operation.
+func (r *Ring) GetOwnedTokens(op Operation) RingTokens {
+	r.mtx.RLock()
+	defer r.mtx.RUnlock()
+
+	return r.ringDesc.getTokensForOperation(op, r.cfg.HeartbeatTimeout)
 }
 
 func (r *Ring) search(key uint32) int {
@@ -439,4 +462,54 @@ func (r *Ring) Subring(key uint32, n int) (ReadRing, error) {
 	}
 
 	return sub, nil
+}
+
+// WaitInstanceState waits until the input instanceID is registered within the
+// ring matching the provided state.
+func (r *Ring) WaitInstanceState(ctx context.Context, instanceID string, state IngesterState) error {
+	backoff := util.NewBackoff(ctx, util.BackoffConfig{
+		MinBackoff: 100 * time.Millisecond,
+		MaxBackoff: time.Second,
+		MaxRetries: 0,
+	})
+
+	for backoff.Ongoing() {
+		if actualState, err := r.GetInstanceState(instanceID); err == nil && actualState == state {
+			return nil
+		}
+
+		backoff.Wait()
+	}
+
+	return backoff.Err()
+}
+
+// GetInstanceState returns the current state of an instance or an error if the
+// instance does not exist in the ring.
+func (r *Ring) GetInstanceState(instanceID string) (IngesterState, error) {
+	r.mtx.RLock()
+	defer r.mtx.RUnlock()
+
+	instances := r.ringDesc.GetIngesters()
+	instance, ok := instances[instanceID]
+	if !ok {
+		return PENDING, ErrInstanceNotFound
+	}
+
+	return instance.GetState(), nil
+}
+
+// GetInstanceAddr returns the instance address or an error if the
+// instance does not exist in the ring.
+func (r *Ring) GetInstanceAddr(instanceID string) (string, error) {
+	r.mtx.RLock()
+	defer r.mtx.RUnlock()
+
+	instances := r.ringDesc.GetIngesters()
+	instance, ok := instances[instanceID]
+	if !ok {
+		return "", ErrInstanceNotFound
+	}
+
+	return instance.GetAddr(), nil
 }

@@ -2,6 +2,7 @@ package storegateway
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"time"
 
@@ -11,6 +12,18 @@ import (
 	"github.com/cortexproject/cortex/pkg/ring/kv"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
+)
+
+const (
+	// StoreGatewayRingKey is the key under which we store the store gateways ring in the KVStore.
+	RingKey = "store-gateway"
+
+	// StoreGatewayRingName is the name of the ring used by the store gateways.
+	RingName = "store-gateway"
+
+	// We use a safe default instead of exposing to config option to the user
+	// in order to simplify the config.
+	RingNumTokens = 512
 )
 
 // RingConfig masks the ring lifecycler config which contains
@@ -55,39 +68,30 @@ func (cfg *RingConfig) RegisterFlags(f *flag.FlagSet) {
 	f.StringVar(&cfg.InstanceID, "store-gateway.ring.instance-id", hostname, "Instance ID to register in the ring.")
 }
 
-// ToLifecyclerConfig returns a LifecyclerConfig based on the store gateway
-// ring config.
-func (cfg *RingConfig) ToLifecyclerConfig() ring.LifecyclerConfig {
-	// We have to make sure that the ring.LifecyclerConfig and ring.Config
-	// defaults are preserved
-	lc := ring.LifecyclerConfig{}
+func (cfg *RingConfig) ToRingConfig() ring.Config {
 	rc := ring.Config{}
-
-	flagext.DefaultValues(&lc)
 	flagext.DefaultValues(&rc)
 
-	// Configure ring
 	rc.KVStore = cfg.KVStore
 	rc.HeartbeatTimeout = cfg.HeartbeatTimeout
 	rc.ReplicationFactor = cfg.ReplicationFactor
 
-	// Configure lifecycler
-	lc.RingConfig = rc
-	lc.ListenPort = &cfg.ListenPort
-	lc.Addr = cfg.InstanceAddr
-	lc.Port = cfg.InstancePort
-	lc.ID = cfg.InstanceID
-	lc.InfNames = cfg.InstanceInterfaceNames
-	lc.SkipUnregister = false
-	lc.HeartbeatPeriod = cfg.HeartbeatPeriod
-	lc.ObservePeriod = 0
-	lc.JoinAfter = 0
-	lc.MinReadyDuration = 0
-	lc.FinalSleep = 0
+	return rc
+}
 
-	// We use a safe default instead of exposing to config option to the user
-	// in order to simplify the config.
-	lc.NumTokens = 512
+func (cfg *RingConfig) ToBasicLifecyclerConfig() (ring.BasicLifecyclerConfig, error) {
+	instanceAddr, err := ring.GetInstanceAddr(cfg.InstanceAddr, cfg.InstanceInterfaceNames)
+	if err != nil {
+		return ring.BasicLifecyclerConfig{}, err
+	}
 
-	return lc
+	instancePort := ring.GetInstancePort(cfg.InstancePort, cfg.ListenPort)
+
+	return ring.BasicLifecyclerConfig{
+		ID:                  cfg.InstanceID,
+		Addr:                fmt.Sprintf("%s:%d", instanceAddr, instancePort),
+		HeartbeatPeriod:     cfg.HeartbeatPeriod,
+		TokensObservePeriod: 0,
+		NumTokens:           RingNumTokens,
+	}, nil
 }

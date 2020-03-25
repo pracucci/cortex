@@ -101,6 +101,32 @@ func (cfg *LifecyclerConfig) RegisterFlagsWithPrefix(prefix string, f *flag.Flag
 	f.StringVar(&cfg.Zone, prefix+"availability-zone", "", "The availability zone of the host, this instance is running on. Default is an empty string, which disables zone awareness for writes.")
 }
 
+// GetAddr returns the address to which the service is exposed.
+// TODO use GetInstanceAddr()
+func (cfg *LifecyclerConfig) GetAddr() (string, error) {
+	addr := cfg.Addr
+	if addr == "" {
+		var err error
+		addr, err = util.GetFirstAddressOf(cfg.InfNames)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	return addr, nil
+}
+
+// GetPort returns the port to which the service is exposed.
+// TODO use GetInstancePort()
+func (cfg *LifecyclerConfig) GetPort() int {
+	port := cfg.Port
+	if port == 0 {
+		port = *cfg.ListenPort
+	}
+
+	return port
+}
+
 // Lifecycler is responsible for managing the lifecycle of entries in the ring.
 type Lifecycler struct {
 	*services.BasicService
@@ -139,18 +165,11 @@ type Lifecycler struct {
 
 // NewLifecycler creates new Lifecycler. It must be started via StartAsync.
 func NewLifecycler(cfg LifecyclerConfig, flushTransferer FlushTransferer, ringName, ringKey string, flushOnShutdown bool) (*Lifecycler, error) {
-	addr := cfg.Addr
-	if addr == "" {
-		var err error
-		addr, err = util.GetFirstAddressOf(cfg.InfNames)
-		if err != nil {
-			return nil, err
-		}
+	addr, err := cfg.GetAddr()
+	if err != nil {
+		return nil, err
 	}
-	port := cfg.Port
-	if port == 0 {
-		port = *cfg.ListenPort
-	}
+
 	codec := GetCodec()
 	store, err := kv.NewClient(cfg.RingConfig.KVStore, codec)
 	if err != nil {
@@ -173,7 +192,7 @@ func NewLifecycler(cfg LifecyclerConfig, flushTransferer FlushTransferer, ringNa
 		flushTransferer: flushTransferer,
 		KVStore:         store,
 
-		Addr:            fmt.Sprintf("%s:%d", addr, port),
+		Addr:            fmt.Sprintf("%s:%d", addr, cfg.GetPort()),
 		ID:              cfg.ID,
 		RingName:        ringName,
 		RingKey:         ringKey,
@@ -557,7 +576,7 @@ func (i *Lifecycler) verifyTokens(ctx context.Context) bool {
 		// At this point, we should have the same tokens as we have registered before
 		ringTokens, takenTokens := ringDesc.TokensFor(i.ID)
 
-		if !i.compareTokens(ringTokens) {
+		if !i.getTokens().Equals(ringTokens) {
 			// uh, oh... our tokens are not our anymore. Let's try new ones.
 			needTokens := i.cfg.NumTokens - len(ringTokens)
 
@@ -585,24 +604,6 @@ func (i *Lifecycler) verifyTokens(ctx context.Context) bool {
 	}
 
 	return result
-}
-
-func (i *Lifecycler) compareTokens(fromRing Tokens) bool {
-	sort.Sort(fromRing)
-
-	tokens := i.getTokens()
-	sort.Sort(tokens)
-
-	if len(tokens) != len(fromRing) {
-		return false
-	}
-
-	for i := 0; i < len(tokens); i++ {
-		if tokens[i] != fromRing[i] {
-			return false
-		}
-	}
-	return true
 }
 
 // autoJoin selects random tokens & moves state to targetState

@@ -72,5 +72,13 @@ compactor:
       consul:
         host: consul:8500
 
+store_gateway:
+  sharding_enabled: true
+  sharding_ring:
+    kvstore:
+      store: consul
+      consul:
+        host: consul:8500
+
 frontend_worker:
   frontend_address: "query-frontend:9007"
