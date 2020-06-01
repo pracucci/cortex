@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
+	"strconv"
 	"testing"
 	"time"
 
@@ -12,6 +14,7 @@ import (
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/storage"
@@ -26,6 +29,10 @@ import (
 	"github.com/weaveworks/common/user"
 	"google.golang.org/grpc"
 
+	"github.com/cortexproject/cortex/pkg/chunk"
+	promchunk "github.com/cortexproject/cortex/pkg/chunk/encoding"
+	"github.com/cortexproject/cortex/pkg/ingester/client"
+	"github.com/cortexproject/cortex/pkg/querier/batch"
 	"github.com/cortexproject/cortex/pkg/storegateway/storegatewaypb"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/services"
@@ -612,4 +619,218 @@ func mockHintsResponse(ids ...ulid.ULID) *storepb.SeriesResponse {
 			Hints: any,
 		},
 	}
+}
+
+func mkAggrChunk(minT, maxT, step int64) storepb.AggrChunk {
+	chunk := chunkenc.NewXORChunk()
+	appender, err := chunk.Appender()
+	if err != nil {
+		panic(err)
+	}
+
+	for ts := minT; ts < maxT; ts += step {
+		appender.Append(ts, float64(ts))
+	}
+
+	return storepb.AggrChunk{
+		MinTime: minT,
+		MaxTime: maxT,
+		Raw:     &storepb.Chunk{Type: storepb.Chunk_XOR, Data: chunk.Bytes()},
+	}
+}
+
+func BenchmarkMergeSeriesSet_Iterator(b *testing.B) {
+	const (
+		numStoreGateways         = 10 // Each store gateway has the same series, so this is also the duplication factor.
+		numSeriesPerStoreGateway = 2000
+		numChunksPerSeries       = 10
+		numSamplesPerChunk       = 120
+	)
+
+	seriesSets := []storage.SeriesSet(nil)
+	for g := 0; g < numStoreGateways; g++ {
+		mySeries := []*storepb.Series(nil)
+
+		for s := 0; s < numSeriesPerStoreGateway; s++ {
+			lbl := mkLabels("series_id", strconv.Itoa(s))
+			chunks := []storepb.AggrChunk(nil)
+
+			for c := 0; c < numChunksPerSeries; c++ {
+				chunks = append(chunks, mkAggrChunk(int64(c*numSamplesPerChunk), int64((c*numSamplesPerChunk)+numSamplesPerChunk), 1))
+			}
+
+			mySeries = append(mySeries, &storepb.Series{
+				Labels: lbl,
+				Chunks: chunks,
+			})
+		}
+
+		seriesSets = append(seriesSets, &blockQuerierSeriesSet{series: mySeries})
+	}
+	merged := storage.NewMergeSeriesSet(seriesSets, storage.ChainedSeriesMerge)
+
+	b.ResetTimer()
+
+	for merged.Next() {
+		for it := merged.At().Iterator(); it.Next(); {
+			it.At()
+		}
+	}
+}
+
+func BenchmarkMergeSeriesSet_IteratorOptimized(b *testing.B) {
+	const (
+		numStoreGateways         = 10 // Each store gateway has the same series, so this is also the duplication factor.
+		numSeriesPerStoreGateway = 2000
+		numChunksPerSeries       = 10
+		numSamplesPerChunk       = 120
+	)
+
+	convertedChunks := []chunk.Chunk(nil)
+
+	for g := 0; g < numStoreGateways; g++ {
+
+		for s := 0; s < numSeriesPerStoreGateway; s++ {
+			lbl := mkLabels("series_id", strconv.Itoa(s))
+
+			for c := 0; c < numChunksPerSeries; c++ {
+				ck := mkAggrChunk(int64(c*numSamplesPerChunk), int64((c*numSamplesPerChunk)+numSamplesPerChunk), 1)
+
+				// Convert chunks
+				convertedChunks = append(convertedChunks, chunk.Chunk{
+					Fingerprint: client.Fingerprint(storepb.LabelsToPromLabelsUnsafe(lbl)),
+					From:        model.Time(ck.MinTime),
+					Through:     model.Time(ck.MaxTime),
+					Metric:      storepb.LabelsToPromLabelsUnsafe(lbl),
+					Encoding:    0, // this shouldn't be used
+					Data:        newChunkAdapter(ck.Raw),
+				})
+			}
+		}
+
+	}
+
+	merged := partitionChunks(convertedChunks, 0, math.MaxInt64, batch.NewChunkMergeIterator)
+
+	b.ResetTimer()
+
+	numSamples := 0
+	for merged.Next() {
+		for it := merged.At().Iterator(); it.Next(); {
+			it.At()
+			numSamples++
+		}
+	}
+
+	expectedSamples := numSeriesPerStoreGateway * numChunksPerSeries * numSamplesPerChunk
+	if numSamples != expectedSamples {
+		b.Fatalf("unexpected number of samples, got %d expected %d", numSamplesPerChunk, expectedSamples)
+	}
+}
+
+type chunkAdapter struct {
+	ck chunkenc.Chunk
+}
+
+func newChunkAdapter(ck *storepb.Chunk) chunkAdapter {
+	rightType, err := chunkenc.FromData(chunkenc.EncXOR, ck.Data)
+	if err != nil {
+		panic(err)
+	}
+
+	return chunkAdapter{
+		ck: rightType,
+	}
+}
+
+func (a chunkAdapter) Add(sample model.SamplePair) (promchunk.Chunk, error) {
+	return nil, errors.New("unsupported")
+}
+
+func (a chunkAdapter) NewIterator(it promchunk.Iterator) promchunk.Iterator {
+	return newIteratorAdapter(a.ck.Iterator(nil))
+}
+
+func (a chunkAdapter) Marshal(io.Writer) error {
+	return errors.New("unsupported")
+}
+func (a chunkAdapter) UnmarshalFromBuf([]byte) error {
+	return errors.New("unsupported")
+}
+func (a chunkAdapter) Encoding() promchunk.Encoding {
+	panic(errors.New("unsupported"))
+}
+func (a chunkAdapter) Utilization() float64 {
+	panic(errors.New("unsupported"))
+}
+func (a chunkAdapter) Slice(start, end model.Time) promchunk.Chunk {
+	panic(errors.New("unsupported"))
+}
+func (a chunkAdapter) Len() int {
+	panic(errors.New("unsupported"))
+}
+func (a chunkAdapter) Size() int {
+	panic(errors.New("unsupported"))
+}
+
+type iteratorAdapter struct {
+	it chunkenc.Iterator
+}
+
+func newIteratorAdapter(it chunkenc.Iterator) iteratorAdapter {
+	return iteratorAdapter{
+		it: it,
+	}
+}
+
+// Scans the next value in the chunk. Directly after the iterator has
+// been created, the next value is the first value in the
+// chunk. Otherwise, it is the value following the last value scanned or
+// found (by one of the Find... methods). Returns false if either the
+// end of the chunk is reached or an error has occurred.
+func (a iteratorAdapter) Scan() bool {
+	return a.it.Next()
+}
+
+// Finds the oldest value at or after the provided time. Returns false
+// if either the chunk contains no value at or after the provided time,
+// or an error has occurred.
+func (a iteratorAdapter) FindAtOrAfter(t model.Time) bool {
+	return a.it.Seek(int64(t))
+}
+
+// Returns the last value scanned (by the scan method) or found (by one
+// of the find... methods). It returns model.ZeroSamplePair before any of
+// those methods were called.
+func (a iteratorAdapter) Value() model.SamplePair {
+	t, v := a.it.At()
+	return model.SamplePair{
+		Timestamp: model.Time(t),
+		Value:     model.SampleValue(v),
+	}
+}
+
+// Returns a batch of the provisded size; NB not idempotent!  Should only be called
+// once per Scan.
+func (a iteratorAdapter) Batch(size int) promchunk.Batch {
+	var batch promchunk.Batch
+	j := 0
+	for j < size {
+		currTs, currValue := a.it.At()
+		batch.Timestamps[j] = currTs
+		batch.Values[j] = currValue
+		j++
+		if j < size && !a.it.Next() {
+			break
+		}
+	}
+	batch.Index = 0
+	batch.Length = j
+	return batch
+}
+
+// Returns the last error encountered. In general, an error signals data
+// corruption in the chunk and requires quarantining.
+func (a iteratorAdapter) Err() error {
+	return a.it.Err()
 }
