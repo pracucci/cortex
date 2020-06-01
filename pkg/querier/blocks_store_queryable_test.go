@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math"
 	"strconv"
 	"testing"
 	"time"
@@ -29,10 +28,11 @@ import (
 	"github.com/weaveworks/common/user"
 	"google.golang.org/grpc"
 
-	"github.com/cortexproject/cortex/pkg/chunk"
+	"github.com/cortexproject/cortex/pkg/chunk/encoding"
 	promchunk "github.com/cortexproject/cortex/pkg/chunk/encoding"
 	"github.com/cortexproject/cortex/pkg/ingester/client"
 	"github.com/cortexproject/cortex/pkg/querier/batch"
+	seriesset "github.com/cortexproject/cortex/pkg/querier/series"
 	"github.com/cortexproject/cortex/pkg/storegateway/storegatewaypb"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/services"
@@ -686,7 +686,8 @@ func BenchmarkMergeSeriesSet_IteratorOptimized(b *testing.B) {
 		numSamplesPerChunk       = 120
 	)
 
-	convertedChunks := []chunk.Chunk(nil)
+	// TODO implement it in a hash collision resistant
+	chunksBySeries := map[model.Fingerprint]*aggrChunkSeries{}
 
 	for g := 0; g < numStoreGateways; g++ {
 
@@ -696,23 +697,47 @@ func BenchmarkMergeSeriesSet_IteratorOptimized(b *testing.B) {
 			for c := 0; c < numChunksPerSeries; c++ {
 				ck := mkAggrChunk(int64(c*numSamplesPerChunk), int64((c*numSamplesPerChunk)+numSamplesPerChunk), 1)
 
+				adapted, err := newChunkAdapter(ck)
+				if err != nil {
+					b.Fatal(err)
+				}
+
+				fp := client.Fingerprint(storepb.LabelsToPromLabelsUnsafe(lbl))
+				if cbs, ok := chunksBySeries[fp]; ok {
+					cbs.chunks = append(cbs.chunks, adapted)
+				} else {
+					chunksBySeries[fp] = &aggrChunkSeries{
+						labels: storepb.LabelsToPromLabelsUnsafe(lbl),
+						chunks: []batch.Chunk{adapted},
+					}
+				}
+
 				// Convert chunks
-				convertedChunks = append(convertedChunks, chunk.Chunk{
-					Fingerprint: client.Fingerprint(storepb.LabelsToPromLabelsUnsafe(lbl)),
-					From:        model.Time(ck.MinTime),
-					Through:     model.Time(ck.MaxTime),
-					Metric:      storepb.LabelsToPromLabelsUnsafe(lbl),
-					Encoding:    0, // this shouldn't be used
-					Data:        newChunkAdapter(ck.Raw),
-				})
+				/*
+					convertedChunks = append(convertedChunks, chunk.Chunk{
+						Fingerprint: client.Fingerprint(storepb.LabelsToPromLabelsUnsafe(lbl)),
+						From:        model.Time(ck.MinTime),
+						Through:     model.Time(ck.MaxTime),
+						Metric:      storepb.LabelsToPromLabelsUnsafe(lbl),
+						Encoding:    0, // this shouldn't be used
+						Data:        newChunkAdapter(ck.Raw),
+					})
+				*/
 			}
 		}
 
 	}
 
-	merged := partitionChunks(convertedChunks, 0, math.MaxInt64, batch.NewChunkMergeIterator)
-
 	b.ResetTimer()
+
+	//merged := partitionChunks(convertedChunks, 0, math.MaxInt64, batch.NewChunkMergeIterator)
+
+	series := make([]storage.Series, 0, len(chunksBySeries))
+	for _, cbs := range chunksBySeries {
+		series = append(series, cbs)
+	}
+
+	merged := seriesset.NewConcreteSeriesSet(series)
 
 	numSamples := 0
 	for merged.Next() {
@@ -728,6 +753,53 @@ func BenchmarkMergeSeriesSet_IteratorOptimized(b *testing.B) {
 	}
 }
 
+type aggrChunkSeries struct {
+	labels labels.Labels
+	chunks []batch.Chunk
+}
+
+func (s *aggrChunkSeries) Labels() labels.Labels {
+	return s.labels
+}
+
+func (s *aggrChunkSeries) Iterator() chunkenc.Iterator {
+	return batch.NewGenericChunkMergeIterator(s.chunks)
+}
+
+type chunkAdapter struct {
+	minTime int64
+	maxTime int64
+	chunk   chunkenc.Chunk
+}
+
+func newChunkAdapter(chunkAggr storepb.AggrChunk) (chunkAdapter, error) {
+	// TODO the encoding type must be based on AggrChunk's encoding
+	chunk, err := chunkenc.FromData(chunkenc.EncXOR, chunkAggr.Raw.Data)
+	if err != nil {
+		return chunkAdapter{}, err
+	}
+
+	return chunkAdapter{
+		minTime: chunkAggr.MinTime,
+		maxTime: chunkAggr.MaxTime,
+		chunk:   chunk,
+	}, nil
+}
+
+func (a chunkAdapter) MinTime() int64 {
+	return a.minTime
+}
+
+func (a chunkAdapter) MaxTime() int64 {
+	return a.maxTime
+}
+
+func (a chunkAdapter) Iterator(reuse encoding.Iterator) encoding.Iterator {
+	// TODO add support to reuse the iterator
+	return newIteratorAdapter(a.chunk.Iterator(nil))
+}
+
+/*
 type chunkAdapter struct {
 	ck chunkenc.Chunk
 }
@@ -772,6 +844,7 @@ func (a chunkAdapter) Len() int {
 func (a chunkAdapter) Size() int {
 	panic(errors.New("unsupported"))
 }
+*/
 
 type iteratorAdapter struct {
 	it chunkenc.Iterator
