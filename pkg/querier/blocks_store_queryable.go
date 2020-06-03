@@ -15,9 +15,11 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/extprom"
@@ -27,7 +29,12 @@ import (
 	"golang.org/x/sync/errgroup"
 	grpc_metadata "google.golang.org/grpc/metadata"
 
+	"github.com/cortexproject/cortex/pkg/chunk/encoding"
+	promchunk "github.com/cortexproject/cortex/pkg/chunk/encoding"
+	"github.com/cortexproject/cortex/pkg/ingester/client"
+	"github.com/cortexproject/cortex/pkg/querier/batch"
 	"github.com/cortexproject/cortex/pkg/querier/series"
+	seriesset "github.com/cortexproject/cortex/pkg/querier/series"
 	"github.com/cortexproject/cortex/pkg/ring"
 	"github.com/cortexproject/cortex/pkg/ring/kv"
 	cortex_tsdb "github.com/cortexproject/cortex/pkg/storage/tsdb"
@@ -344,10 +351,11 @@ func (q *blocksStoreQuerier) selectSorted(sp *storage.SelectHints, matchers ...*
 	level.Debug(spanLog).Log("msg", "found store-gateway instances to query", "num instances", len(clients))
 
 	var (
-		reqCtx            = grpc_metadata.AppendToOutgoingContext(spanCtx, cortex_tsdb.TenantIDExternalLabel, q.userID)
-		g, gCtx           = errgroup.WithContext(reqCtx)
-		mtx               = sync.Mutex{}
-		seriesSets        = []storage.SeriesSet(nil)
+		reqCtx  = grpc_metadata.AppendToOutgoingContext(spanCtx, cortex_tsdb.TenantIDExternalLabel, q.userID)
+		g, gCtx = errgroup.WithContext(reqCtx)
+		mtx     = sync.Mutex{}
+		//seriesSets = []storage.SeriesSet(nil)
+		seriesSets        = make([][]*storepb.Series, 0, len(clients))
 		warnings          = storage.Warnings(nil)
 		queriedBlocks     = map[string][]hintspb.Block{}
 		convertedMatchers = convertMatchersToLabelMatcher(matchers)
@@ -401,6 +409,11 @@ func (q *blocksStoreQuerier) selectSorted(sp *storage.SelectHints, matchers ...*
 				}
 			}
 
+			// Since the chunks of a single series can be splitted into multiple consecutive gRPC frames
+			// we do aggregate them into single series. See Thanos documentation for StoreClient.Series
+			// call for details.
+			mergeReceivedSeriesChunks(mySeries)
+
 			level.Debug(spanLog).Log("msg", "received series from store-gateway",
 				"instance", c,
 				"num series", len(mySeries),
@@ -410,7 +423,8 @@ func (q *blocksStoreQuerier) selectSorted(sp *storage.SelectHints, matchers ...*
 
 			// Store the result.
 			mtx.Lock()
-			seriesSets = append(seriesSets, &blockQuerierSeriesSet{series: mySeries})
+			seriesSets = append(seriesSets, mySeries)
+			//seriesSets = append(seriesSets, &blockQuerierSeriesSet{series: mySeries})
 			warnings = append(warnings, myWarnings...)
 			queriedBlocks[c.RemoteAddress()] = myQueriedBlocks
 			mtx.Unlock()
@@ -435,7 +449,70 @@ func (q *blocksStoreQuerier) selectSorted(sp *storage.SelectHints, matchers ...*
 		}
 	}
 
-	return storage.NewMergeSeriesSet(seriesSets, storage.ChainedSeriesMerge), warnings, nil
+	allSeries := mergeReceivedSeriesSets(seriesSets)
+	convertedSeries := make([]storage.Series, len(allSeries))
+	for sid, series := range allSeries {
+		convertedChunks := make([]batch.GenericChunk, len(series.Chunks))
+		for cid, chunk := range series.Chunks {
+			adapted, err := newChunkAdapter(chunk)
+			if err != nil {
+				return nil, nil, err // TODO wrap this error
+			}
+
+			convertedChunks[cid] = batch.NewGenericChunk(chunk.MinTime, chunk.MaxTime, adapted.Iterator)
+		}
+
+		convertedSeries[sid] = &aggrChunkSeries{
+			labels: storepb.LabelsToPromLabelsUnsafe(series.Labels),
+			chunks: convertedChunks,
+		}
+	}
+
+	return seriesset.NewConcreteSeriesSet(convertedSeries), warnings, nil
+	//return storage.NewMergeSeriesSet(seriesSets, storage.ChainedSeriesMerge), warnings, nil
+}
+
+// mergeReceivedSeriesChunks merge together chunks of the same exact input consecutive series.
+func mergeReceivedSeriesChunks(series []*storepb.Series) {
+	for idx := 1; idx < len(series); {
+		prev := series[idx-1]
+		curr := series[idx]
+
+		// TODO use an equality check, because it's faster
+		if storepb.CompareLabels(prev.Labels, curr.Labels) != 0 {
+			idx++
+			continue
+		}
+
+		// Merge it.
+		prev.Chunks = append(prev.Chunks, curr.Chunks...)
+		series = append(series[:idx], series[idx+1:]...)
+	}
+}
+
+// TODO document
+// TODO could be implemented more optimized considering each input set is already sorted
+func mergeReceivedSeriesSets(sets [][]*storepb.Series) []*storepb.Series {
+	// TODO implement it in a hash collision resistant way
+	chunksBySeries := map[model.Fingerprint]*storepb.Series{}
+
+	for _, set := range sets {
+		for _, series := range set {
+			fp := client.Fingerprint(storepb.LabelsToPromLabelsUnsafe(series.Labels))
+			if cbs, ok := chunksBySeries[fp]; ok {
+				cbs.Chunks = append(cbs.Chunks, series.Chunks...)
+			} else {
+				chunksBySeries[fp] = series
+			}
+		}
+	}
+
+	list := make([]*storepb.Series, 0, len(chunksBySeries))
+	for _, series := range chunksBySeries {
+		list = append(list, series)
+	}
+
+	return list
 }
 
 func createSeriesRequest(minT, maxT int64, matchers []storepb.LabelMatcher, blockIDs []ulid.ULID) (*storepb.SeriesRequest, error) {
@@ -490,4 +567,113 @@ func countSeriesBytes(series []*storepb.Series) (count uint64) {
 	}
 
 	return count
+}
+
+// TODO rename/move/test
+type aggrChunkSeries struct {
+	labels labels.Labels
+	chunks []batch.GenericChunk
+}
+
+func (s *aggrChunkSeries) Labels() labels.Labels {
+	return s.labels
+}
+
+func (s *aggrChunkSeries) Iterator() chunkenc.Iterator {
+	return batch.NewGenericChunkMergeIterator(s.chunks)
+}
+
+type chunkAdapter struct {
+	minTime int64
+	maxTime int64
+	chunk   chunkenc.Chunk
+}
+
+func newChunkAdapter(chunkAggr storepb.AggrChunk) (chunkAdapter, error) {
+	// TODO the encoding type must be based on AggrChunk's encoding
+	chunk, err := chunkenc.FromData(chunkenc.EncXOR, chunkAggr.Raw.Data)
+	if err != nil {
+		return chunkAdapter{}, err
+	}
+
+	return chunkAdapter{
+		minTime: chunkAggr.MinTime,
+		maxTime: chunkAggr.MaxTime,
+		chunk:   chunk,
+	}, nil
+}
+
+func (a chunkAdapter) MinTime() int64 {
+	return a.minTime
+}
+
+func (a chunkAdapter) MaxTime() int64 {
+	return a.maxTime
+}
+
+func (a chunkAdapter) Iterator(reuse encoding.Iterator) encoding.Iterator {
+	// TODO add support to reuse the iterator
+	return newIteratorAdapter(a.chunk.Iterator(nil))
+}
+
+type iteratorAdapter struct {
+	it chunkenc.Iterator
+}
+
+func newIteratorAdapter(it chunkenc.Iterator) iteratorAdapter {
+	return iteratorAdapter{
+		it: it,
+	}
+}
+
+// Scans the next value in the chunk. Directly after the iterator has
+// been created, the next value is the first value in the
+// chunk. Otherwise, it is the value following the last value scanned or
+// found (by one of the Find... methods). Returns false if either the
+// end of the chunk is reached or an error has occurred.
+func (a iteratorAdapter) Scan() bool {
+	return a.it.Next()
+}
+
+// Finds the oldest value at or after the provided time. Returns false
+// if either the chunk contains no value at or after the provided time,
+// or an error has occurred.
+func (a iteratorAdapter) FindAtOrAfter(t model.Time) bool {
+	return a.it.Seek(int64(t))
+}
+
+// Returns the last value scanned (by the scan method) or found (by one
+// of the find... methods). It returns model.ZeroSamplePair before any of
+// those methods were called.
+func (a iteratorAdapter) Value() model.SamplePair {
+	t, v := a.it.At()
+	return model.SamplePair{
+		Timestamp: model.Time(t),
+		Value:     model.SampleValue(v),
+	}
+}
+
+// Returns a batch of the provisded size; NB not idempotent!  Should only be called
+// once per Scan.
+func (a iteratorAdapter) Batch(size int) promchunk.Batch {
+	var batch promchunk.Batch
+	j := 0
+	for j < size {
+		currTs, currValue := a.it.At()
+		batch.Timestamps[j] = currTs
+		batch.Values[j] = currValue
+		j++
+		if j < size && !a.it.Next() {
+			break
+		}
+	}
+	batch.Index = 0
+	batch.Length = j
+	return batch
+}
+
+// Returns the last error encountered. In general, an error signals data
+// corruption in the chunk and requires quarantining.
+func (a iteratorAdapter) Err() error {
+	return a.it.Err()
 }

@@ -28,8 +28,6 @@ import (
 	"github.com/weaveworks/common/user"
 	"google.golang.org/grpc"
 
-	"github.com/cortexproject/cortex/pkg/chunk/encoding"
-	promchunk "github.com/cortexproject/cortex/pkg/chunk/encoding"
 	"github.com/cortexproject/cortex/pkg/ingester/client"
 	"github.com/cortexproject/cortex/pkg/querier/batch"
 	seriesset "github.com/cortexproject/cortex/pkg/querier/series"
@@ -569,9 +567,6 @@ type storeGatewaySeriesClientMock struct {
 }
 
 func (m *storeGatewaySeriesClientMock) Recv() (*storepb.SeriesResponse, error) {
-	// Ensure some concurrency occurs.
-	time.Sleep(10 * time.Millisecond)
-
 	if len(m.mockedResponses) == 0 {
 		return nil, io.EOF
 	}
@@ -639,6 +634,132 @@ func mkAggrChunk(minT, maxT, step int64) storepb.AggrChunk {
 	}
 }
 
+func BenchmarkBlockStoreQuerier_selectSorted_ReturnedSeriesSetCompositionAndIteration(b *testing.B) {
+	scenarios := []struct {
+		numSeries          int
+		numChunksPerSeries int
+		numSamplesPerChunk int
+		duplicationFactor  int
+	}{
+		{numSeries: 10000, numChunksPerSeries: 24, numSamplesPerChunk: 120, duplicationFactor: 1},
+		{numSeries: 10000, numChunksPerSeries: 24, numSamplesPerChunk: 120, duplicationFactor: 3},
+		{numSeries: 10000, numChunksPerSeries: 1, numSamplesPerChunk: 120, duplicationFactor: 1},
+		{numSeries: 10000, numChunksPerSeries: 1, numSamplesPerChunk: 120, duplicationFactor: 3},
+
+		// Worst case scenario for duplication factor: non deduplicated blocks (3x replication factor
+		// in the ingesters) queried across all store-gateway replicas (3x blocks replication factor in
+		//the store-gateway).
+		{numSeries: 10000, numChunksPerSeries: 1, numSamplesPerChunk: 120, duplicationFactor: 9},
+	}
+
+	for _, scenario := range scenarios {
+		name := fmt.Sprintf("series: %d chunks per series: %d samples per chunk: %d duplication factor: %d",
+			scenario.numSeries,
+			scenario.numChunksPerSeries,
+			scenario.numSamplesPerChunk,
+			scenario.duplicationFactor)
+
+		blockID := ulid.MustNew(0, nil)
+
+		// Create the mocked backend store-gateways, simulating the duplication factor
+		// as several different gateways all returning the same series set.
+		storeSetRes := map[BlocksStoreClient][]ulid.ULID{}
+		for d := 1; d <= scenario.duplicationFactor; d++ {
+			// Create the series returned from each mocked store-gateway.
+			seriesRes := make([]*storepb.SeriesResponse, 0, scenario.numSeries)
+
+			for s := 0; s < scenario.numSeries; s++ {
+				metric := mkLabels("series_id", strconv.Itoa(s))
+				chunks := make([]storepb.AggrChunk, 0, scenario.numChunksPerSeries)
+
+				for c := 0; c < scenario.numChunksPerSeries; c++ {
+					minT := int64(c * scenario.numSamplesPerChunk)
+					maxT := int64((c * scenario.numSamplesPerChunk) + scenario.numSamplesPerChunk)
+					step := int64(1)
+
+					chunks = append(chunks, mkAggrChunk(minT, maxT, step))
+				}
+
+				seriesRes = append(seriesRes, &storepb.SeriesResponse{
+					Result: &storepb.SeriesResponse_Series{
+						Series: &storepb.Series{
+							Labels: metric,
+							Chunks: chunks,
+						},
+					},
+				})
+			}
+
+			client := &storeGatewayClientMock{
+				remoteAddr:      fmt.Sprintf("1.1.1.%d", d),
+				mockedResponses: seriesRes,
+			}
+
+			storeSetRes[client] = []ulid.ULID{blockID}
+		}
+
+		// Mock the finder to return a block, to ensure the mocked store is queried.
+		finder := &blocksFinderMock{}
+		finder.On("GetBlocks", "test", mock.Anything, mock.Anything).Return([]*BlockMeta{
+			{Meta: metadata.Meta{BlockMeta: tsdb.BlockMeta{ULID: blockID}}},
+		}, map[ulid.ULID]*metadata.DeletionMark(nil), nil)
+
+		q := &blocksStoreQuerier{
+			ctx:             context.Background(),
+			minT:            0,
+			maxT:            0,
+			userID:          "test",
+			finder:          finder,
+			stores:          &blocksStoreSetMock{mockedResult: storeSetRes},
+			storesHit:       prometheus.NewHistogram(prometheus.HistogramOpts{}),
+			consistency:     nil,
+			logger:          log.NewNopLogger(),
+			queryStoreAfter: 0,
+		}
+
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+
+			for n := 0; n < b.N; n++ {
+				// IMPORTANT: we include the selectSorted() in the timing measurement because the iterator
+				// used has a performance impact on initializing the iterator itself, so it's more fair to
+				// include this time as well in the measurement. The storage backend is mocked, so other
+				// overhead of selectSorted() doesn't matter significantly.
+				res, _, err := q.selectSorted(&storage.SelectHints{})
+				require.NoError(b, err)
+
+				// Iterate every single sample in the returned series set.
+				numSamples := 0
+				numSeries := 0
+
+				for res.Next() {
+					numSeries++
+
+					it := res.At().Iterator()
+					for it.Next() {
+						numSamples++
+						it.At()
+					}
+
+					// Ensure no error occurred
+					if it.Err() != nil {
+						b.Fatal(it.Err().Error())
+					}
+				}
+
+				// Ensure no error occurred
+				if res.Err() != nil {
+					b.Fatal(res.Err().Error())
+				}
+
+				// Quick consistency check to ensure all series and samples have been iterated (and deduplicated).
+				require.Equal(b, scenario.numSeries, numSeries)
+				require.Equal(b, scenario.numSeries*scenario.numChunksPerSeries*scenario.numSamplesPerChunk, numSamples)
+			}
+		})
+	}
+}
+
 func BenchmarkMergeSeriesSet_Iterator(b *testing.B) {
 	const (
 		numStoreGateways         = 10 // Each store gateway has the same series, so this is also the duplication factor.
@@ -690,7 +811,6 @@ func BenchmarkMergeSeriesSet_IteratorOptimized(b *testing.B) {
 	chunksBySeries := map[model.Fingerprint]*aggrChunkSeries{}
 
 	for g := 0; g < numStoreGateways; g++ {
-
 		for s := 0; s < numSeriesPerStoreGateway; s++ {
 			lbl := mkLabels("series_id", strconv.Itoa(s))
 
@@ -704,39 +824,23 @@ func BenchmarkMergeSeriesSet_IteratorOptimized(b *testing.B) {
 
 				fp := client.Fingerprint(storepb.LabelsToPromLabelsUnsafe(lbl))
 				if cbs, ok := chunksBySeries[fp]; ok {
-					cbs.chunks = append(cbs.chunks, adapted)
+					cbs.chunks = append(cbs.chunks, batch.NewGenericChunk(ck.MinTime, ck.MaxTime, adapted.Iterator))
 				} else {
 					chunksBySeries[fp] = &aggrChunkSeries{
 						labels: storepb.LabelsToPromLabelsUnsafe(lbl),
-						chunks: []batch.Chunk{adapted},
+						chunks: []batch.GenericChunk{batch.NewGenericChunk(ck.MinTime, ck.MaxTime, adapted.Iterator)},
 					}
 				}
-
-				// Convert chunks
-				/*
-					convertedChunks = append(convertedChunks, chunk.Chunk{
-						Fingerprint: client.Fingerprint(storepb.LabelsToPromLabelsUnsafe(lbl)),
-						From:        model.Time(ck.MinTime),
-						Through:     model.Time(ck.MaxTime),
-						Metric:      storepb.LabelsToPromLabelsUnsafe(lbl),
-						Encoding:    0, // this shouldn't be used
-						Data:        newChunkAdapter(ck.Raw),
-					})
-				*/
 			}
 		}
-
 	}
 
 	b.ResetTimer()
-
-	//merged := partitionChunks(convertedChunks, 0, math.MaxInt64, batch.NewChunkMergeIterator)
 
 	series := make([]storage.Series, 0, len(chunksBySeries))
 	for _, cbs := range chunksBySeries {
 		series = append(series, cbs)
 	}
-
 	merged := seriesset.NewConcreteSeriesSet(series)
 
 	numSamples := 0
@@ -751,159 +855,4 @@ func BenchmarkMergeSeriesSet_IteratorOptimized(b *testing.B) {
 	if numSamples != expectedSamples {
 		b.Fatalf("unexpected number of samples, got %d expected %d", numSamplesPerChunk, expectedSamples)
 	}
-}
-
-type aggrChunkSeries struct {
-	labels labels.Labels
-	chunks []batch.Chunk
-}
-
-func (s *aggrChunkSeries) Labels() labels.Labels {
-	return s.labels
-}
-
-func (s *aggrChunkSeries) Iterator() chunkenc.Iterator {
-	return batch.NewGenericChunkMergeIterator(s.chunks)
-}
-
-type chunkAdapter struct {
-	minTime int64
-	maxTime int64
-	chunk   chunkenc.Chunk
-}
-
-func newChunkAdapter(chunkAggr storepb.AggrChunk) (chunkAdapter, error) {
-	// TODO the encoding type must be based on AggrChunk's encoding
-	chunk, err := chunkenc.FromData(chunkenc.EncXOR, chunkAggr.Raw.Data)
-	if err != nil {
-		return chunkAdapter{}, err
-	}
-
-	return chunkAdapter{
-		minTime: chunkAggr.MinTime,
-		maxTime: chunkAggr.MaxTime,
-		chunk:   chunk,
-	}, nil
-}
-
-func (a chunkAdapter) MinTime() int64 {
-	return a.minTime
-}
-
-func (a chunkAdapter) MaxTime() int64 {
-	return a.maxTime
-}
-
-func (a chunkAdapter) Iterator(reuse encoding.Iterator) encoding.Iterator {
-	// TODO add support to reuse the iterator
-	return newIteratorAdapter(a.chunk.Iterator(nil))
-}
-
-/*
-type chunkAdapter struct {
-	ck chunkenc.Chunk
-}
-
-func newChunkAdapter(ck *storepb.Chunk) chunkAdapter {
-	rightType, err := chunkenc.FromData(chunkenc.EncXOR, ck.Data)
-	if err != nil {
-		panic(err)
-	}
-
-	return chunkAdapter{
-		ck: rightType,
-	}
-}
-
-func (a chunkAdapter) Add(sample model.SamplePair) (promchunk.Chunk, error) {
-	return nil, errors.New("unsupported")
-}
-
-func (a chunkAdapter) NewIterator(it promchunk.Iterator) promchunk.Iterator {
-	return newIteratorAdapter(a.ck.Iterator(nil))
-}
-
-func (a chunkAdapter) Marshal(io.Writer) error {
-	return errors.New("unsupported")
-}
-func (a chunkAdapter) UnmarshalFromBuf([]byte) error {
-	return errors.New("unsupported")
-}
-func (a chunkAdapter) Encoding() promchunk.Encoding {
-	panic(errors.New("unsupported"))
-}
-func (a chunkAdapter) Utilization() float64 {
-	panic(errors.New("unsupported"))
-}
-func (a chunkAdapter) Slice(start, end model.Time) promchunk.Chunk {
-	panic(errors.New("unsupported"))
-}
-func (a chunkAdapter) Len() int {
-	panic(errors.New("unsupported"))
-}
-func (a chunkAdapter) Size() int {
-	panic(errors.New("unsupported"))
-}
-*/
-
-type iteratorAdapter struct {
-	it chunkenc.Iterator
-}
-
-func newIteratorAdapter(it chunkenc.Iterator) iteratorAdapter {
-	return iteratorAdapter{
-		it: it,
-	}
-}
-
-// Scans the next value in the chunk. Directly after the iterator has
-// been created, the next value is the first value in the
-// chunk. Otherwise, it is the value following the last value scanned or
-// found (by one of the Find... methods). Returns false if either the
-// end of the chunk is reached or an error has occurred.
-func (a iteratorAdapter) Scan() bool {
-	return a.it.Next()
-}
-
-// Finds the oldest value at or after the provided time. Returns false
-// if either the chunk contains no value at or after the provided time,
-// or an error has occurred.
-func (a iteratorAdapter) FindAtOrAfter(t model.Time) bool {
-	return a.it.Seek(int64(t))
-}
-
-// Returns the last value scanned (by the scan method) or found (by one
-// of the find... methods). It returns model.ZeroSamplePair before any of
-// those methods were called.
-func (a iteratorAdapter) Value() model.SamplePair {
-	t, v := a.it.At()
-	return model.SamplePair{
-		Timestamp: model.Time(t),
-		Value:     model.SampleValue(v),
-	}
-}
-
-// Returns a batch of the provisded size; NB not idempotent!  Should only be called
-// once per Scan.
-func (a iteratorAdapter) Batch(size int) promchunk.Batch {
-	var batch promchunk.Batch
-	j := 0
-	for j < size {
-		currTs, currValue := a.it.At()
-		batch.Timestamps[j] = currTs
-		batch.Values[j] = currValue
-		j++
-		if j < size && !a.it.Next() {
-			break
-		}
-	}
-	batch.Index = 0
-	batch.Length = j
-	return batch
-}
-
-// Returns the last error encountered. In general, an error signals data
-// corruption in the chunk and requires quarantining.
-func (a iteratorAdapter) Err() error {
-	return a.it.Err()
 }

@@ -16,7 +16,6 @@ import (
 	"github.com/prometheus/prometheus/pkg/labels"
 	errs "github.com/weaveworks/common/errors"
 
-	"github.com/cortexproject/cortex/pkg/chunk/encoding"
 	prom_chunk "github.com/cortexproject/cortex/pkg/chunk/encoding"
 	"github.com/cortexproject/cortex/pkg/prom1/storage/metric"
 )
@@ -374,21 +373,6 @@ func (c *Chunk) Slice(from, through model.Time) (*Chunk, error) {
 
 	nc := NewChunk(c.UserID, c.Fingerprint, c.Metric, pc, from, through)
 	return &nc, nil
-}
-
-// MinTime implements batch.MinTime.
-func (c *Chunk) MinTime() int64 {
-	return int64(c.From)
-}
-
-// MaxTime implements batch.MaxTime.
-func (c *Chunk) MaxTime() int64 {
-	return int64(c.Through)
-}
-
-// Iterator implements batch.Iterator.
-func (c *Chunk) Iterator(reuse encoding.Iterator) encoding.Iterator {
-	return c.Data.NewIterator(reuse)
 }
 
 func intervalsOverlap(interval1, interval2 model.Interval) bool {
