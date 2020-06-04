@@ -300,6 +300,8 @@ func (q *blocksStoreQuerier) Close() error {
 }
 
 func (q *blocksStoreQuerier) selectSorted(sp *storage.SelectHints, matchers ...*labels.Matcher) (storage.SeriesSet, storage.Warnings, error) {
+	const newImplementation = true
+
 	spanLog, spanCtx := spanlogger.New(q.ctx, "blocksStoreQuerier.selectSorted")
 	defer spanLog.Span.Finish()
 
@@ -351,11 +353,11 @@ func (q *blocksStoreQuerier) selectSorted(sp *storage.SelectHints, matchers ...*
 	level.Debug(spanLog).Log("msg", "found store-gateway instances to query", "num instances", len(clients))
 
 	var (
-		reqCtx  = grpc_metadata.AppendToOutgoingContext(spanCtx, cortex_tsdb.TenantIDExternalLabel, q.userID)
-		g, gCtx = errgroup.WithContext(reqCtx)
-		mtx     = sync.Mutex{}
-		//seriesSets = []storage.SeriesSet(nil)
-		seriesSets        = make([][]*storepb.Series, 0, len(clients))
+		reqCtx            = grpc_metadata.AppendToOutgoingContext(spanCtx, cortex_tsdb.TenantIDExternalLabel, q.userID)
+		g, gCtx           = errgroup.WithContext(reqCtx)
+		mtx               = sync.Mutex{}
+		oldSeriesSets     = []storage.SeriesSet(nil)
+		newSeriesSets     = make([][]*storepb.Series, 0, len(clients))
 		warnings          = storage.Warnings(nil)
 		queriedBlocks     = map[string][]hintspb.Block{}
 		convertedMatchers = convertMatchersToLabelMatcher(matchers)
@@ -412,7 +414,9 @@ func (q *blocksStoreQuerier) selectSorted(sp *storage.SelectHints, matchers ...*
 			// Since the chunks of a single series can be splitted into multiple consecutive gRPC frames
 			// we do aggregate them into single series. See Thanos documentation for StoreClient.Series
 			// call for details.
-			mergeReceivedSeriesChunks(mySeries)
+			if newImplementation {
+				mergeReceivedSeriesChunks(mySeries)
+			}
 
 			level.Debug(spanLog).Log("msg", "received series from store-gateway",
 				"instance", c,
@@ -423,8 +427,11 @@ func (q *blocksStoreQuerier) selectSorted(sp *storage.SelectHints, matchers ...*
 
 			// Store the result.
 			mtx.Lock()
-			seriesSets = append(seriesSets, mySeries)
-			//seriesSets = append(seriesSets, &blockQuerierSeriesSet{series: mySeries})
+			if newImplementation {
+				newSeriesSets = append(newSeriesSets, mySeries)
+			} else {
+				oldSeriesSets = append(oldSeriesSets, &blockQuerierSeriesSet{series: mySeries})
+			}
 			warnings = append(warnings, myWarnings...)
 			queriedBlocks[c.RemoteAddress()] = myQueriedBlocks
 			mtx.Unlock()
@@ -449,27 +456,30 @@ func (q *blocksStoreQuerier) selectSorted(sp *storage.SelectHints, matchers ...*
 		}
 	}
 
-	allSeries := mergeReceivedSeriesSets(seriesSets)
-	convertedSeries := make([]storage.Series, len(allSeries))
-	for sid, series := range allSeries {
-		convertedChunks := make([]batch.GenericChunk, len(series.Chunks))
-		for cid, chunk := range series.Chunks {
-			adapted, err := newChunkAdapter(chunk)
-			if err != nil {
-				return nil, nil, err // TODO wrap this error
+	if newImplementation {
+		allSeries := mergeReceivedSeriesSets(newSeriesSets)
+		convertedSeries := make([]storage.Series, len(allSeries))
+		for sid, series := range allSeries {
+			convertedChunks := make([]batch.GenericChunk, len(series.Chunks))
+			for cid, chunk := range series.Chunks {
+				adapted, err := newChunkAdapter(chunk)
+				if err != nil {
+					return nil, nil, err // TODO wrap this error
+				}
+
+				convertedChunks[cid] = batch.NewGenericChunk(chunk.MinTime, chunk.MaxTime, adapted.Iterator)
 			}
 
-			convertedChunks[cid] = batch.NewGenericChunk(chunk.MinTime, chunk.MaxTime, adapted.Iterator)
+			convertedSeries[sid] = &aggrChunkSeries{
+				labels: storepb.LabelsToPromLabelsUnsafe(series.Labels),
+				chunks: convertedChunks,
+			}
 		}
 
-		convertedSeries[sid] = &aggrChunkSeries{
-			labels: storepb.LabelsToPromLabelsUnsafe(series.Labels),
-			chunks: convertedChunks,
-		}
+		return seriesset.NewConcreteSeriesSet(convertedSeries), warnings, nil
+	} else {
+		return storage.NewMergeSeriesSet(oldSeriesSets, storage.ChainedSeriesMerge), warnings, nil
 	}
-
-	return seriesset.NewConcreteSeriesSet(convertedSeries), warnings, nil
-	//return storage.NewMergeSeriesSet(seriesSets, storage.ChainedSeriesMerge), warnings, nil
 }
 
 // mergeReceivedSeriesChunks merge together chunks of the same exact input consecutive series.
