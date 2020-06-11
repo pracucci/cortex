@@ -885,10 +885,15 @@ func (enh *EvalNodeHelper) signatureFunc(on bool, names ...string) func(labels.L
 // step.  The return value is the combination into time series of all the
 // function call results.
 func (ev *evaluator) rangeEval(f func([]parser.Value, *EvalNodeHelper) Vector, exprs ...parser.Expr) Matrix {
+	var span opentracing.Span
+	span, ev.ctx = opentracing.StartSpanFromContext(ev.ctx, "evaluator.rangeEval")
+	defer span.Finish()
+
 	numSteps := int((ev.endTimestamp-ev.startTimestamp)/ev.interval) + 1
 	matrixes := make([]Matrix, len(exprs))
 	origMatrixes := make([]Matrix, len(exprs))
 	originalNumSamples := ev.currentSamples
+	span.LogKV("numSteps", numSteps, "numExprs", len(exprs))
 
 	for i, e := range exprs {
 		// Functions will take string arguments from the expressions, not the values.
@@ -902,6 +907,7 @@ func (ev *evaluator) rangeEval(f func([]parser.Value, *EvalNodeHelper) Vector, e
 			copy(origMatrixes[i], matrixes[i])
 		}
 	}
+	span.LogKV("msg", "evaluated sub expressions")
 
 	vectors := make([]Vector, len(exprs))    // Input vectors for the function.
 	args := make([]parser.Value, len(exprs)) // Argument to function.
@@ -914,10 +920,18 @@ func (ev *evaluator) rangeEval(f func([]parser.Value, *EvalNodeHelper) Vector, e
 			biggestLen = len(matrixes[i])
 		}
 	}
+	span.LogKV("msg", "created output vector")
+
 	enh := &EvalNodeHelper{out: make(Vector, 0, biggestLen)}
 	seriess := make(map[uint64]Series, biggestLen) // Output series by series hash.
 	tempNumSamples := ev.currentSamples
+	numIterations := 0
+	gatheredInputVectorsTime := time.Duration(0)
+	calledFunctionTime := time.Duration(0)
 	for ts := ev.startTimestamp; ts <= ev.endTimestamp; ts += ev.interval {
+		beginTime := time.Now()
+		numIterations++
+
 		if err := contextDone(ev.ctx, "expression evaluation"); err != nil {
 			ev.error(err)
 		}
@@ -944,6 +958,8 @@ func (ev *evaluator) rangeEval(f func([]parser.Value, *EvalNodeHelper) Vector, e
 			}
 			args[i] = vectors[i]
 		}
+		gatheredInputVectorsTime += time.Since(beginTime)
+
 		// Make the function call.
 		enh.ts = ts
 		result := f(args, enh)
@@ -951,6 +967,7 @@ func (ev *evaluator) rangeEval(f func([]parser.Value, *EvalNodeHelper) Vector, e
 			ev.errorf("vector cannot contain metrics with the same labelset")
 		}
 		enh.out = result[:0] // Reuse result vector.
+		calledFunctionTime += time.Since(beginTime)
 
 		ev.currentSamples += len(result)
 		// When we reset currentSamples to tempNumSamples during the next iteration of the loop it also
@@ -988,6 +1005,11 @@ func (ev *evaluator) rangeEval(f func([]parser.Value, *EvalNodeHelper) Vector, e
 
 		}
 	}
+	span.LogKV(
+		"msg", "iterated for all steps",
+		"numIterations", numIterations,
+		"time spent gathering input (ms)", gatheredInputVectorsTime.Milliseconds(),
+		"time spent calling function (ms)", (calledFunctionTime - gatheredInputVectorsTime).Milliseconds())
 
 	// Reuse the original point slices.
 	for _, m := range origMatrixes {
@@ -995,11 +1017,15 @@ func (ev *evaluator) rangeEval(f func([]parser.Value, *EvalNodeHelper) Vector, e
 			putPointSlice(s.Points)
 		}
 	}
+	span.LogKV("msg", "put point slices back to the pool")
+
 	// Assemble the output matrix. By the time we get here we know we don't have too many samples.
 	mat := make(Matrix, 0, len(seriess))
 	for _, ss := range seriess {
 		mat = append(mat, ss)
 	}
+	span.LogKV("msg", "assembled matrix")
+
 	ev.currentSamples = originalNumSamples + mat.TotalSamples()
 	return mat
 }
@@ -1024,6 +1050,8 @@ func (ev *evaluator) evalSubquery(subq *parser.SubqueryExpr) *parser.MatrixSelec
 
 // eval evaluates the given expression as the given AST expression node requires.
 func (ev *evaluator) eval(expr parser.Expr) parser.Value {
+	var span opentracing.Span
+
 	// This is the top-level evaluation method.
 	// Thus, we check for timeout/cancellation here.
 	if err := contextDone(ev.ctx, "expression evaluation"); err != nil {
@@ -1033,6 +1061,8 @@ func (ev *evaluator) eval(expr parser.Expr) parser.Value {
 
 	switch e := expr.(type) {
 	case *parser.AggregateExpr:
+		span, ev.ctx = opentracing.StartSpanFromContext(ev.ctx, "evaluator.eval -> parser.AggregateExpr")
+		defer span.Finish()
 		unwrapParenExpr(&e.Param)
 		if s, ok := e.Param.(*parser.StringLiteral); ok {
 			return ev.rangeEval(func(v []parser.Value, enh *EvalNodeHelper) Vector {
@@ -1048,6 +1078,8 @@ func (ev *evaluator) eval(expr parser.Expr) parser.Value {
 		}, e.Param, e.Expr)
 
 	case *parser.Call:
+		span, ev.ctx = opentracing.StartSpanFromContext(ev.ctx, "evaluator.eval -> parser.Call")
+		defer span.Finish()
 		call := FunctionCalls[e.Func.Name]
 
 		if e.Func.Name == "timestamp" {
@@ -1219,9 +1251,13 @@ func (ev *evaluator) eval(expr parser.Expr) parser.Value {
 		return mat
 
 	case *parser.ParenExpr:
+		span, ev.ctx = opentracing.StartSpanFromContext(ev.ctx, "evaluator.eval -> parser.ParenExpr")
+		defer span.Finish()
 		return ev.eval(e.Expr)
 
 	case *parser.UnaryExpr:
+		span, ev.ctx = opentracing.StartSpanFromContext(ev.ctx, "evaluator.eval -> parser.UnaryExpr")
+		defer span.Finish()
 		mat := ev.eval(e.Expr).(Matrix)
 		if e.Op == parser.SUB {
 			for i := range mat {
@@ -1237,6 +1273,9 @@ func (ev *evaluator) eval(expr parser.Expr) parser.Value {
 		return mat
 
 	case *parser.BinaryExpr:
+		span, ev.ctx = opentracing.StartSpanFromContext(ev.ctx, "evaluator.eval -> parser.BinaryExpr")
+		span.LogKV("left type", e.LHS.Type(), "right type", e.RHS.Type())
+		defer span.Finish()
 		switch lt, rt := e.LHS.Type(), e.RHS.Type(); {
 		case lt == parser.ValueTypeScalar && rt == parser.ValueTypeScalar:
 			return ev.rangeEval(func(v []parser.Value, enh *EvalNodeHelper) Vector {
@@ -1275,15 +1314,26 @@ func (ev *evaluator) eval(expr parser.Expr) parser.Value {
 		}
 
 	case *parser.NumberLiteral:
+		span, ev.ctx = opentracing.StartSpanFromContext(ev.ctx, "evaluator.eval -> parser.NumberLiteral")
+		defer span.Finish()
 		return ev.rangeEval(func(v []parser.Value, enh *EvalNodeHelper) Vector {
 			return append(enh.out, Sample{Point: Point{V: e.Val}})
 		})
 
 	case *parser.VectorSelector:
+		span, ev.ctx = opentracing.StartSpanFromContext(ev.ctx, "evaluator.eval -> parser.VectorSelector")
+		defer span.Finish()
 		checkForSeriesSetExpansion(ev.ctx, e)
 		mat := make(Matrix, 0, len(e.Series))
 		it := storage.NewBuffer(durationMilliseconds(ev.lookbackDelta))
+
+		// TODO DEBUG
+		numSeries := 0
+		numSamples := 0
+
 		for i, s := range e.Series {
+			numSeries++
+
 			it.Reset(s.Iterator())
 			ss := Series{
 				Metric: e.Series[i].Labels(),
@@ -1303,21 +1353,28 @@ func (ev *evaluator) eval(expr parser.Expr) parser.Value {
 			}
 
 			if len(ss.Points) > 0 {
+				numSamples += len(ss.Points)
 				mat = append(mat, ss)
 			} else {
 				putPointSlice(ss.Points)
 			}
-
 		}
+
+		span.LogKV("numSeries", numSeries, "numSamples", numSamples)
+
 		return mat
 
 	case *parser.MatrixSelector:
+		span, ev.ctx = opentracing.StartSpanFromContext(ev.ctx, "evaluator.eval -> parser.MatrixSelector")
+		defer span.Finish()
 		if ev.startTimestamp != ev.endTimestamp {
 			panic(errors.New("cannot do range evaluation of matrix selector"))
 		}
 		return ev.matrixSelector(e)
 
 	case *parser.SubqueryExpr:
+		span, ev.ctx = opentracing.StartSpanFromContext(ev.ctx, "evaluator.eval -> parser.SubqueryExpr")
+		defer span.Finish()
 		offsetMillis := durationToInt64Millis(e.Offset)
 		rangeMillis := durationToInt64Millis(e.Range)
 		newEv := &evaluator{
@@ -1346,6 +1403,8 @@ func (ev *evaluator) eval(expr parser.Expr) parser.Value {
 		ev.currentSamples = newEv.currentSamples
 		return res
 	case *parser.StringLiteral:
+		span, ev.ctx = opentracing.StartSpanFromContext(ev.ctx, "evaluator.eval -> parser.StringLiteral")
+		defer span.Finish()
 		return String{V: e.Val, T: ev.startTimestamp}
 	}
 
@@ -1529,6 +1588,10 @@ func (ev *evaluator) matrixIterSlice(it *storage.BufferedSeriesIterator, mint, m
 }
 
 func (ev *evaluator) VectorAnd(lhs, rhs Vector, matching *parser.VectorMatching, enh *EvalNodeHelper) Vector {
+	//var span opentracing.Span
+	//span, ev.ctx = opentracing.StartSpanFromContext(ev.ctx, "evaluator.VectorAnd")
+	//defer span.Finish()
+
 	if matching.Card != parser.CardManyToMany {
 		panic("set operations must only use many-to-many matching")
 	}
@@ -1551,6 +1614,10 @@ func (ev *evaluator) VectorAnd(lhs, rhs Vector, matching *parser.VectorMatching,
 }
 
 func (ev *evaluator) VectorOr(lhs, rhs Vector, matching *parser.VectorMatching, enh *EvalNodeHelper) Vector {
+	//var span opentracing.Span
+	//span, ev.ctx = opentracing.StartSpanFromContext(ev.ctx, "evaluator.VectorOr")
+	//defer span.Finish()
+
 	if matching.Card != parser.CardManyToMany {
 		panic("set operations must only use many-to-many matching")
 	}
@@ -1572,6 +1639,10 @@ func (ev *evaluator) VectorOr(lhs, rhs Vector, matching *parser.VectorMatching, 
 }
 
 func (ev *evaluator) VectorUnless(lhs, rhs Vector, matching *parser.VectorMatching, enh *EvalNodeHelper) Vector {
+	//var span opentracing.Span
+	//span, ev.ctx = opentracing.StartSpanFromContext(ev.ctx, "evaluator.VectorUnless")
+	//defer span.Finish()
+
 	if matching.Card != parser.CardManyToMany {
 		panic("set operations must only use many-to-many matching")
 	}
@@ -1592,6 +1663,10 @@ func (ev *evaluator) VectorUnless(lhs, rhs Vector, matching *parser.VectorMatchi
 
 // VectorBinop evaluates a binary operation between two Vectors, excluding set operators.
 func (ev *evaluator) VectorBinop(op parser.ItemType, lhs, rhs Vector, matching *parser.VectorMatching, returnBool bool, enh *EvalNodeHelper) Vector {
+	//var span opentracing.Span
+	//span, ev.ctx = opentracing.StartSpanFromContext(ev.ctx, "evaluator.VectorBinop")
+	//defer span.Finish()
+
 	if matching.Card == parser.CardManyToMany {
 		panic("many-to-many only allowed for set operators")
 	}
@@ -1771,6 +1846,10 @@ func resultMetric(lhs, rhs labels.Labels, op parser.ItemType, matching *parser.V
 
 // VectorscalarBinop evaluates a binary operation between a Vector and a Scalar.
 func (ev *evaluator) VectorscalarBinop(op parser.ItemType, lhs Vector, rhs Scalar, swap, returnBool bool, enh *EvalNodeHelper) Vector {
+	//var span opentracing.Span
+	//span, ev.ctx = opentracing.StartSpanFromContext(ev.ctx, "evaluator.VectorscalarBinop")
+	//defer span.Finish()
+
 	for _, lhsSample := range lhs {
 		lv, rv := lhsSample.V, rhs.V
 		// lhs always contains the Vector. If the original position was different
@@ -1880,6 +1959,9 @@ type groupedAggregation struct {
 
 // aggregation evaluates an aggregation operation on a Vector.
 func (ev *evaluator) aggregation(op parser.ItemType, grouping []string, without bool, param interface{}, vec Vector, enh *EvalNodeHelper) Vector {
+	//var span opentracing.Span
+	//span, ev.ctx = opentracing.StartSpanFromContext(ev.ctx, "evaluator.aggregation")
+	//defer span.Finish()
 
 	result := map[uint64]*groupedAggregation{}
 	var k int64
