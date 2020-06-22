@@ -35,6 +35,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/ruler"
 	"github.com/cortexproject/cortex/pkg/storegateway"
 	"github.com/cortexproject/cortex/pkg/storegateway/storegatewaypb"
+	"github.com/cortexproject/cortex/pkg/ui"
 	"github.com/cortexproject/cortex/pkg/util/push"
 )
 
@@ -372,6 +373,13 @@ func (a *API) registerQueryAPI(handler http.Handler) {
 func (a *API) RegisterQueryFrontend(f *frontend.Frontend) {
 	frontend.RegisterFrontendServer(a.server.GRPC, f)
 	a.registerQueryAPI(f.Handler())
+}
+
+// RegisterUI registers the Cortex deep view UI and its API endpoints.
+func (a *API) RegisterUI(s *ui.StorageAPI) {
+	a.RegisterRoute("/api/v1/storage/bucket", http.HandlerFunc(s.GetBucket), false, "GET")
+	a.RegisterRoute("/api/v1/storage/bucket/{tenant_id}", http.HandlerFunc(s.GetUserBlocks), false, "GET")
+	a.RegisterRoute("/api/v1/storage/bucket/{tenant_id}/{block_id}", http.HandlerFunc(s.GetUserBlock), false, "GET")
 }
 
 // RegisterServiceMapHandler registers the Cortex structs service handler

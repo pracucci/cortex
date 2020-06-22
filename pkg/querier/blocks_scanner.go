@@ -96,6 +96,19 @@ func NewBlocksScanner(cfg BlocksScannerConfig, bucketClient objstore.Bucket, log
 	return d
 }
 
+// GetUsers return known users.
+func (d *BlocksScanner) GetUsers() []string {
+	d.userMx.RLock()
+	defer d.userMx.RUnlock()
+
+	users := make([]string, 0, len(d.userMetas))
+	for userID := range d.userMetas {
+		users = append(users, userID)
+	}
+
+	return users
+}
+
 // GetBlocks returns known blocks for userID containing samples within the range minT
 // and maxT (milliseconds, both included). Returned blocks are sorted by MaxTime descending.
 func (d *BlocksScanner) GetBlocks(userID string, minT, maxT int64) ([]*BlockMeta, map[ulid.ULID]*metadata.DeletionMark, error) {

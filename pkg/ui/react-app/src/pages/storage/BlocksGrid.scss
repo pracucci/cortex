@@ -1,0 +1,125 @@
+// Blocks are colored using a shade of blue based on the compression
+// level. Lightest color for the 1st level, darkest color for the highest
+// level.
+$block_color_level_1: #A1E7F0;
+$block_color_level_2: #64C5D7;
+$block_color_level_3: #3399BD;
+$block_color_level_4: #206A9D;
+$block_color_level_5: #004C8D;
+$block_color_level_unknown: gray;
+
+.blocks-grid {
+    display: table;
+
+    // All children are table rows.
+    > div {
+        display: table-row;
+
+        // All children are table cells.
+        > div {
+            display: table-cell;
+        }
+    }
+
+    > .block {
+        .block-id,
+        .block-info {
+            border-bottom: 1px solid #dedede;
+        }
+
+        .block-id {
+            // Use a monospace font to keep all block IDs aligned.
+            font-family: monospace;
+            font-size: 14px;
+            padding-right: 20px;
+
+            a {
+                color: black;
+            }
+        }
+
+        .block-info {
+            // Should take all the available space.
+            width: 100%;
+        }
+
+        .block-id,
+        .block-span {
+            line-height: 30px;
+        }
+
+        .block-span {
+            // When changing the time range, the block span may partially move
+            // outside of the range.
+            overflow: hidden;
+
+            > span {
+                // The width and position is calculate dynamically by the code.
+                display: inline-block;
+                vertical-align: middle;
+                height: 20px;
+                background-color: $block_color_level_unknown;
+                border-radius: 2px;
+            }
+        }
+
+        .block-details {
+            display: table;
+            font-size: 14px;
+            margin-top: 10px;
+
+            > .detail {
+                display: table-row;
+
+                > .name,
+                > .value {
+                    display: table-cell;
+                }
+
+                > .name {
+                    padding-right: 5px;
+                }
+            }
+        }
+
+        // Color the span differently based on the compaction level.
+        &.compaction-level-1 .block-span span { background-color: $block_color_level_1; }
+        &.compaction-level-2 .block-span span { background-color: $block_color_level_2; }
+        &.compaction-level-3 .block-span span { background-color: $block_color_level_3; }
+        &.compaction-level-4 .block-span span { background-color: $block_color_level_4; }
+        &.compaction-level-5 .block-span span { background-color: $block_color_level_5; }
+    }
+
+    > .time-picker {
+        > div {
+            height: 20px;
+        }
+    }
+
+    > .time-range {
+        > div {
+            position: relative;
+            height: 30px;
+            font-size: 14px;
+
+            > .time-label {
+                position: absolute;
+                height: 30px;
+
+                &.min {
+                    text-align: left;
+                    left: 0;
+                    border-left: 1px solid #dedede;
+                    padding-left: 5px;
+                }
+
+                &.max {
+                    text-align: right;
+                    right: 0;
+                    border-right: 1px solid #dedede;
+                    padding-right: 5px;
+                }
+            }
+        }
+    }
+}

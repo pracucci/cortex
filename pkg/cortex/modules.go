@@ -31,6 +31,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/ring/kv/memberlist"
 	"github.com/cortexproject/cortex/pkg/ruler"
 	"github.com/cortexproject/cortex/pkg/storegateway"
+	"github.com/cortexproject/cortex/pkg/ui"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/modules"
 	"github.com/cortexproject/cortex/pkg/util/runtimeconfig"
@@ -61,6 +62,7 @@ const (
 	StoreGateway        string = "store-gateway"
 	MemberlistKV        string = "memberlist-kv"
 	DataPurger          string = "data-purger"
+	UI                  string = "ui"
 	All                 string = "all"
 )
 
@@ -509,6 +511,16 @@ func (t *Cortex) initDataPurger() (services.Service, error) {
 	return t.DataPurger, nil
 }
 
+func (t *Cortex) initUI() (services.Service, error) {
+	storage, err := ui.NewStorageAPI(t.Cfg.TSDB, util.Logger)
+	if err != nil {
+		return nil, err
+	}
+
+	t.API.RegisterUI(storage)
+	return storage, nil
+}
+
 func (t *Cortex) setupModuleManager() error {
 	mm := modules.NewManager()
 
@@ -535,6 +547,7 @@ func (t *Cortex) setupModuleManager() error {
 	mm.RegisterModule(Compactor, t.initCompactor)
 	mm.RegisterModule(StoreGateway, t.initStoreGateway)
 	mm.RegisterModule(DataPurger, t.initDataPurger)
+	mm.RegisterModule(UI, t.initUI)
 	mm.RegisterModule(All, nil)
 	mm.RegisterModule(StoreGateway, t.initStoreGateway)
 
@@ -557,6 +570,7 @@ func (t *Cortex) setupModuleManager() error {
 		Compactor:      {API},
 		StoreGateway:   {API},
 		DataPurger:     {Store, DeleteRequestsStore, API},
+		UI:             {API},
 		All:            {QueryFrontend, Querier, Ingester, Distributor, TableManager, DataPurger, StoreGateway},
 	}
 	for mod, targets := range deps {

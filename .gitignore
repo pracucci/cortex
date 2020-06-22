@@ -11,3 +11,4 @@ website/content/en/docs
 e2e_integration_test*
 active-query-tracker
 dist/
+pkg/ui/react-app/node_modules
