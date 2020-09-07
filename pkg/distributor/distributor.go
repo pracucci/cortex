@@ -145,6 +145,9 @@ type Distributor struct {
 	// Manager for subservices (HA Tracker, distributor ring and client pool)
 	subservices        *services.Manager
 	subservicesWatcher *services.FailureWatcher
+
+	// Cache for user subrings.
+	subringCache *subringCache
 }
 
 // Config contains the configuration require to
@@ -246,6 +249,7 @@ func New(cfg Config, clientConfig ingester_client.Config, limits *validation.Ove
 		limits:               limits,
 		ingestionRateLimiter: limiter.NewRateLimiter(ingestionRateStrategy, 10*time.Second),
 		HATracker:            replicas,
+		subringCache:         newSubringCache(),
 	}
 
 	subservices = append(subservices, d.ingesterPool)
@@ -266,11 +270,18 @@ func (d *Distributor) starting(ctx context.Context) error {
 }
 
 func (d *Distributor) running(ctx context.Context) error {
-	select {
-	case <-ctx.Done():
-		return nil
-	case err := <-d.subservicesWatcher.Chan():
-		return errors.Wrap(err, "distributor subservice failed")
+	t := time.NewTicker(cacheTTL / 3)
+	defer t.Stop()
+
+	for {
+		select {
+		case ts := <-t.C:
+			d.subringCache.purge(ts)
+		case <-ctx.Done():
+			return nil
+		case err := <-d.subservicesWatcher.Chan():
+			return errors.Wrap(err, "distributor subservice failed")
+		}
 	}
 }
 
@@ -533,7 +544,9 @@ func (d *Distributor) Push(ctx context.Context, req *client.WriteRequest) (*clie
 
 	// Obtain a subring if required.
 	if d.cfg.ShardingStrategy == ShardingStrategyShuffle {
-		subRing = d.ingestersRing.ShuffleShard(userID, d.limits.IngestionTenantShardSize(userID), nil)
+		cachedRing := d.subringCache.userSubring(now, userID)
+		subRing = d.ingestersRing.ShuffleShard(userID, d.limits.IngestionTenantShardSize(userID), cachedRing)
+		d.subringCache.setUserSubring(now, userID, subRing)
 	}
 
 	keys := append(seriesKeys, metadataKeys...)
