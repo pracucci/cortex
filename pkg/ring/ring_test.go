@@ -6,15 +6,19 @@ import (
 	"math"
 	"math/rand"
 	"sort"
-	strconv "strconv"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/cortexproject/cortex/pkg/ring/kv"
+	"github.com/cortexproject/cortex/pkg/ring/kv/consul"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
+	"github.com/cortexproject/cortex/pkg/util/services"
+	"github.com/cortexproject/cortex/pkg/util/test"
 )
 
 const (
@@ -213,7 +217,7 @@ func TestRing_ShuffleShard(t *testing.T) {
 				strategy:         &DefaultReplicationStrategy{},
 			}
 
-			shardRing := ring.ShuffleShard("tenant-id", testData.shardSize)
+			shardRing := ring.ShuffleShard("tenant-id", testData.shardSize, nil)
 			assert.Equal(t, testData.expectedSize, shardRing.IngesterCount())
 
 			// Compute the actual distribution of instances across zones.
@@ -263,13 +267,13 @@ func TestRing_ShuffleShard_Stability(t *testing.T) {
 		tenantID := fmt.Sprintf("%d", i)
 
 		for _, size := range shardSizes {
-			r := ring.ShuffleShard(tenantID, size)
+			r := ring.ShuffleShard(tenantID, size, nil)
 			expected, err := r.GetAll(Read)
 			require.NoError(t, err)
 
 			// Assert that multiple invocations generate the same exact shard.
 			for n := 0; n < numInvocations; n++ {
-				r := ring.ShuffleShard(tenantID, size)
+				r := ring.ShuffleShard(tenantID, size, nil)
 				actual, err := r.GetAll(Read)
 				require.NoError(t, err)
 				assert.ElementsMatch(t, expected.Ingesters, actual.Ingesters)
@@ -327,7 +331,7 @@ func TestRing_ShuffleShard_Shuffling(t *testing.T) {
 
 	for i := 1; i <= numTenants; i++ {
 		tenantID := fmt.Sprintf("%d", i)
-		r := ring.ShuffleShard(tenantID, shardSize)
+		r := ring.ShuffleShard(tenantID, shardSize, nil)
 		set, err := r.GetAll(Read)
 		require.NoError(t, err)
 
@@ -420,7 +424,7 @@ func TestRing_ShuffleShard_Consistency(t *testing.T) {
 			// Compute the initial shard for each tenant.
 			initial := map[int]ReplicationSet{}
 			for id := 0; id < numTenants; id++ {
-				set, err := ring.ShuffleShard(fmt.Sprintf("%d", id), s.shardSize).GetAll(Read)
+				set, err := ring.ShuffleShard(fmt.Sprintf("%d", id), s.shardSize, nil).GetAll(Read)
 				require.NoError(t, err)
 				initial[id] = set
 			}
@@ -446,7 +450,7 @@ func TestRing_ShuffleShard_Consistency(t *testing.T) {
 			// If the "consistency" property is guaranteed, we expect no more then 1 different instance
 			// in the updated shard.
 			for id := 0; id < numTenants; id++ {
-				updated, err := ring.ShuffleShard(fmt.Sprintf("%d", id), s.shardSize).GetAll(Read)
+				updated, err := ring.ShuffleShard(fmt.Sprintf("%d", id), s.shardSize, nil).GetAll(Read)
 				require.NoError(t, err)
 
 				added, removed := compareReplicationSets(initial[id], updated)
@@ -462,25 +466,49 @@ func BenchmarkRing_ShuffleShard(b *testing.B) {
 		for _, numZones := range []int{1, 3} {
 			for _, shardSize := range []int{3, 10, 30} {
 				b.Run(fmt.Sprintf("num instances = %d, num zones = %d, shard size = %d", numInstances, numZones, shardSize), func(b *testing.B) {
-					// Initialise the ring.
-					ringDesc := &Desc{Ingesters: generateRingInstances(numInstances, numZones)}
-					ring := Ring{
-						cfg:              Config{HeartbeatTimeout: time.Hour},
-						ringDesc:         ringDesc,
-						ringTokens:       ringDesc.getTokens(),
-						ringTokensByZone: ringDesc.getTokensByZone(),
-						ringZones:        getZones(ringDesc.getTokensByZone()),
-						strategy:         &DefaultReplicationStrategy{},
-					}
-
-					b.ResetTimer()
-
-					for n := 0; n < b.N; n++ {
-						ring.ShuffleShard("tenant-1", shardSize)
-					}
+					benchmarkShuffleSharding(b, numInstances, numZones, shardSize, false)
 				})
 			}
 		}
+	}
+}
+
+func BenchmarkRing_ShuffleShardCached(b *testing.B) {
+	for _, numInstances := range []int{50, 100, 1000} {
+		for _, numZones := range []int{1, 3} {
+			for _, shardSize := range []int{3, 10, 30} {
+				b.Run(fmt.Sprintf("num instances = %d, num zones = %d, shard size = %d", numInstances, numZones, shardSize), func(b *testing.B) {
+					benchmarkShuffleSharding(b, numInstances, numZones, shardSize, true)
+				})
+			}
+		}
+	}
+}
+
+func benchmarkShuffleSharding(b *testing.B, numInstances, numZones, shardSize int, cache bool) {
+	// Initialise the ring.
+	now := time.Now()
+
+	ringDesc := &Desc{Ingesters: generateRingInstances(numInstances, numZones)}
+	ring := Ring{
+		cfg:                Config{HeartbeatTimeout: time.Hour},
+		ringDesc:           ringDesc,
+		ringTokens:         ringDesc.getTokens(),
+		ringTokensByZone:   ringDesc.getTokensByZone(),
+		ringZones:          getZones(ringDesc.getTokensByZone()),
+		strategy:           &DefaultReplicationStrategy{},
+		lastRingChange:     now,
+		lastIngesterChange: now,
+	}
+
+	b.ResetTimer()
+
+	var cached ReadRing
+	for n := 0; n < b.N; n++ {
+		cached = ring.ShuffleShard("tenant-1", shardSize, cached)
+	}
+	if !cache {
+		cached = nil
 	}
 }
 
@@ -756,4 +784,166 @@ func compareReplicationSets(first, second ReplicationSet) (added, removed []stri
 	}
 
 	return
+}
+
+// This test verifies that ring is getting updates, even after extending check in the loop method.
+func TestRingUpdates(t *testing.T) {
+	inmem := consul.NewInMemoryClient(GetCodec())
+
+	cfg := Config{
+		KVStore:           kv.Config{Mock: inmem},
+		HeartbeatTimeout:  1 * time.Minute,
+		ReplicationFactor: 3,
+	}
+
+	ring, err := New(cfg, "test", "test", nil)
+	require.NoError(t, err)
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), ring))
+	t.Cleanup(func() {
+		_ = services.StartAndAwaitRunning(context.Background(), ring)
+	})
+
+	require.Equal(t, 0, ring.IngesterCount())
+
+	lc1 := startLifecycler(t, cfg, 1, 3)
+	test.Poll(t, 200*time.Millisecond, 1, func() interface{} {
+		return ring.IngesterCount()
+	})
+
+	lc2 := startLifecycler(t, cfg, 2, 3)
+	test.Poll(t, 200*time.Millisecond, 2, func() interface{} {
+		return ring.IngesterCount()
+	})
+
+	lc3 := startLifecycler(t, cfg, 3, 3)
+	test.Poll(t, 200*time.Millisecond, 3, func() interface{} {
+		return ring.IngesterCount()
+	})
+
+	// Sleep for a few seconds (ring timestamp resolution is 1 second, so to verify that ring is updated in the background,
+	// sleep for 2 seconds)
+	time.Sleep(2 * time.Second)
+
+	rs, err := ring.GetAll(Read)
+	require.NoError(t, err)
+
+	now := time.Now()
+	for _, ing := range rs.Ingesters {
+		diff := now.Sub(time.Unix(ing.Timestamp, 0))
+		require.True(t, diff <= time.Second, diff)
+	}
+
+	require.NoError(t, services.StopAndAwaitTerminated(context.Background(), lc2))
+	test.Poll(t, 200*time.Millisecond, 2, func() interface{} {
+		return ring.IngesterCount()
+	})
+
+	require.NoError(t, services.StopAndAwaitTerminated(context.Background(), lc1))
+	test.Poll(t, 200*time.Millisecond, 1, func() interface{} {
+		return ring.IngesterCount()
+	})
+
+	require.NoError(t, services.StopAndAwaitTerminated(context.Background(), lc3))
+	test.Poll(t, 200*time.Millisecond, 0, func() interface{} {
+		return ring.IngesterCount()
+	})
+}
+
+func startLifecycler(t *testing.T, cfg Config, lifecyclerID int, zones int) *Lifecycler {
+	lcCfg := LifecyclerConfig{
+		RingConfig:      cfg,
+		NumTokens:       128,
+		HeartbeatPeriod: 100 * time.Millisecond,
+		ObservePeriod:   0,
+		JoinAfter:       0,
+		Zone:            fmt.Sprintf("zone-%d", lifecyclerID%zones),
+		Addr:            fmt.Sprintf("addr-%d", lifecyclerID),
+		ID:              fmt.Sprintf("ingester-%d", lifecyclerID),
+	}
+
+	lc, err := NewLifecycler(lcCfg, &noopFlushTransferer{}, "test", "test", false, nil)
+	require.NoError(t, err)
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), lc))
+
+	t.Cleanup(func() {
+		_ = services.StartAndAwaitRunning(context.Background(), lc)
+	})
+
+	return lc
+}
+
+// This test checks if shuffle-sharded ring can be reused, and whether it receives
+// updates from "main" ring.
+func TestShuffleShardWithCaching(t *testing.T) {
+	inmem := consul.NewInMemoryClient(GetCodec())
+
+	cfg := Config{
+		KVStore:           kv.Config{Mock: inmem},
+		HeartbeatTimeout:  1 * time.Minute,
+		ReplicationFactor: 3,
+	}
+
+	ring, err := New(cfg, "test", "test", nil)
+	require.NoError(t, err)
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), ring))
+	t.Cleanup(func() {
+		_ = services.StartAndAwaitRunning(context.Background(), ring)
+	})
+
+	// We will stop one third of ingesters later, to see that subring is recomputed.
+	const numLifecyclers = 9
+
+	lcs := []*Lifecycler(nil)
+	for i := 0; i < numLifecyclers; i++ {
+		lc := startLifecycler(t, cfg, i, 3)
+
+		test.Poll(t, time.Second, ACTIVE, func() interface{} {
+			return lc.GetState()
+		})
+
+		lcs = append(lcs, lc)
+	}
+
+	subring := ring.ShuffleShard("user", 3, nil)
+
+	start := time.Now()
+	// Run for two seconds, and make sure we can reuse the subring.
+	for time.Since(start) < 2*time.Second {
+		newSubring := ring.ShuffleShard("user", 3, subring)
+		require.True(t, subring == newSubring)
+		require.Equal(t, 3, subring.IngesterCount())
+	}
+
+	// Make sure subring has up-to-date timestamps.
+	{
+		rs, err := subring.GetAll(Read)
+		require.NoError(t, err)
+
+		now := time.Now()
+		for _, ing := range rs.Ingesters {
+			diff := now.Sub(time.Unix(ing.Timestamp, 0))
+			require.True(t, diff <= time.Second, diff)
+		}
+	}
+
+	// Now stop some ingesters. Subring needs to be recomputed.
+	for i := 0; i < numLifecyclers/3; i++ {
+		require.NoError(t, services.StopAndAwaitTerminated(context.Background(), lcs[i]))
+	}
+
+	test.Poll(t, time.Second, numLifecyclers-numLifecyclers/3, func() interface{} {
+		return ring.IngesterCount()
+	})
+
+	// Change of ingesters -> new subring needed.
+	newSubring := ring.ShuffleShard("user", 3, subring)
+	require.False(t, subring == newSubring)
+	require.Equal(t, 3, subring.IngesterCount())
+
+	// Change of shard size -> new subring needed.
+	subring = newSubring
+	newSubring = ring.ShuffleShard("user", 4, subring)
+	require.False(t, subring == newSubring)
+	// Why 6? We have 3 zones each with 2 ingesters. Shuffle-shard gives all zones the same number of ingesters, so 6 ingesters in total.
+	require.Equal(t, 6, newSubring.IngesterCount())
 }

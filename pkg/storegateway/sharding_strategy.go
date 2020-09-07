@@ -154,7 +154,7 @@ func GetShuffleShardingSubring(ring *ring.Ring, userID string, limits ShardingLi
 		return ring
 	}
 
-	return ring.ShuffleShard(userID, shardSize)
+	return ring.ShuffleShard(userID, shardSize, nil)
 }
 
 type shardingMetadataFilterAdapter struct {

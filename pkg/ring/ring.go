@@ -52,7 +52,11 @@ type ReadRing interface {
 
 	// ShuffleShard returns a subring for the provided identifier (eg. a tenant ID)
 	// and size (number of instances).
-	ShuffleShard(identifier string, size int) ReadRing
+	//
+	// If compatible cached ring is passed to the method (returned by previous call to ShuffleShard with same
+	// identifier) and current set of ingesters hasn't been modified since cached ring, it will be reused.
+	// Timestamps and ingester states will be updated in the cached ring.
+	ShuffleShard(identifier string, size int, cachedRing ReadRing) ReadRing
 
 	// HasInstance returns whether the ring contains an instance matching the provided instanceID.
 	HasInstance(instanceID string) bool
@@ -116,6 +120,13 @@ type Ring struct {
 	ringDesc         *Desc
 	ringTokens       []TokenDesc
 	ringTokensByZone map[string][]TokenDesc
+
+	// When did the ring change last time?
+	lastRingChange time.Time
+	// When did a set of ingesters change last time (ingester changing state or heartbeat is ignored for this timestamp).
+	lastIngesterChange time.Time
+	// Size used for computing shuffle shard. Only used for cache invalidation.
+	ringShardSize int
 
 	// List of zones for which there's at least 1 instance in the ring. This list is guaranteed
 	// to be sorted alphabetically.
@@ -199,6 +210,27 @@ func (r *Ring) loop(ctx context.Context) error {
 		}
 
 		ringDesc := value.(*Desc)
+
+		r.mtx.RLock()
+		prevRing := r.ringDesc
+		r.mtx.RUnlock()
+
+		rc := prevRing.RingCompare(ringDesc)
+		if rc == Equal {
+			return true
+		}
+
+		now := time.Now()
+		if rc == Ingesters {
+			// No need to update tokens or zones. Only states and timestamps
+			// have changed.
+			r.mtx.Lock()
+			r.ringDesc = ringDesc
+			r.lastRingChange = now
+			r.mtx.Unlock()
+			return true
+		}
+
 		ringTokens := ringDesc.getTokens()
 		ringTokensByZone := ringDesc.getTokensByZone()
 		ringZones := getZones(ringTokensByZone)
@@ -209,6 +241,8 @@ func (r *Ring) loop(ctx context.Context) error {
 		r.ringTokens = ringTokens
 		r.ringTokensByZone = ringTokensByZone
 		r.ringZones = ringZones
+		r.lastRingChange = now
+		r.lastIngesterChange = now
 		return true
 	})
 	return nil
@@ -479,16 +513,23 @@ func (r *Ring) Subring(key uint32, n int) ReadRing {
 // generator is initialised with a seed based on the provided identifier.
 //
 // This implementation guarantees:
+//
 // - Stability: given the same ring, two invocations returns the same result.
+//
 // - Consistency: adding/removing 1 instance from the ring generates a resulting
-//   subring with no more then 1 difference.
+// subring with no more then 1 difference.
+//
 // - Shuffling: probabilistically, for a large enough cluster each identifier gets
-//   a different set of instances, with a reduced number of overlapping instances
-//   between two identifiers.
-func (r *Ring) ShuffleShard(identifier string, size int) ReadRing {
+// a different set of instances, with a reduced number of overlapping instances
+// between two identifiers.
+func (r *Ring) ShuffleShard(identifier string, size int, cachedRing ReadRing) ReadRing {
 	// Nothing to do if the shard size is not smaller then the actual ring.
 	if size <= 0 || r.IngesterCount() <= size {
 		return r
+	}
+
+	if r.canUseCachedRing(size, cachedRing) {
+		return cachedRing
 	}
 
 	// Use the identifier to compute an hash we'll use to seed the random.
@@ -559,6 +600,11 @@ func (r *Ring) ShuffleShard(identifier string, size int) ReadRing {
 		ringTokens:       shardDesc.getTokens(),
 		ringTokensByZone: shardTokensByZone,
 		ringZones:        getZones(shardTokensByZone),
+
+		// For caching to work, remember these values.
+		lastIngesterChange: r.lastIngesterChange,
+		lastRingChange:     r.lastRingChange,
+		ringShardSize:      size,
 	}
 }
 
@@ -585,4 +631,49 @@ func (r *Ring) HasInstance(instanceID string) bool {
 	instances := r.ringDesc.GetIngesters()
 	_, ok := instances[instanceID]
 	return ok
+}
+
+func (r *Ring) canUseCachedRing(size int, cachedRing ReadRing) bool {
+	cached, ok := cachedRing.(*Ring)
+	if !ok || cached == nil || cached == r {
+		return false
+	}
+
+	r.mtx.RLock()
+	defer r.mtx.RUnlock()
+
+	if r.lastIngesterChange.IsZero() || r.lastRingChange.IsZero() {
+		return false
+	}
+
+	cached.mtx.Lock()
+	defer cached.mtx.Unlock()
+
+	// If shard size has changed, don't reuse this even if ingesters haven't changed.
+	if cached.ringShardSize != size {
+		return false
+	}
+
+	if cached.lastIngesterChange.IsZero() || cached.lastRingChange.IsZero() {
+		return false
+	}
+
+	if !cached.lastIngesterChange.Equal(r.lastIngesterChange) {
+		// ingesters changed since cached ring was created, cannot be reused.
+		return false
+	}
+
+	if cached.lastRingChange.Equal(r.lastRingChange) {
+		return true
+	}
+
+	// Update ingester states and timestamps. We know that "last ingester change" is the same, so zones and tokens
+	// are equal.
+	for n, cr_ing := range cached.ringDesc.Ingesters {
+		r_ing := r.ringDesc.Ingesters[n]
+		cr_ing.State = r_ing.State
+		cr_ing.Timestamp = r_ing.Timestamp
+		cached.ringDesc.Ingesters[n] = cr_ing
+	}
+	return true
 }
