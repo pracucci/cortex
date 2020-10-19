@@ -1,0 +1,16 @@
+global:
+  scrape_interval: 2s
+  external_labels:
+    cluster:     demo
+    __replica__: prometheus-1
+
+scrape_configs:
+  - job_name: cortex
+    dns_sd_configs:
+      - names: [ "cortex" ]
+        type: "A"
+        port: 80
+        refresh_interval: 5s
+
+remote_write:
+  - url: http://load-balancer/api/prom/push

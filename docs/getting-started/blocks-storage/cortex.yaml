@@ -1,0 +1,64 @@
+auth_enabled: false
+
+# Run Cortex with the blocks storage.
+storage:
+  engine: blocks
+
+# Use a local Minio (S3-compatible) instance as storage.
+blocks_storage:
+  backend: s3
+
+  s3:
+    endpoint:          minio:9000
+    bucket_name:       cortex-blocks
+    access_key_id:     cortex
+    secret_access_key: supersecret
+    insecure:          true
+
+# Use Gossip to share the distributed hash ring.
+memberlist:
+  join_members:
+    - dns+cortex:7946
+  abort_if_cluster_join_fails: false
+
+ingester:
+  lifecycler:
+    final_sleep: 0s
+    heartbeat_period:   2s
+    ring:
+      replication_factor: 3
+      heartbeat_timeout:  15s
+      kvstore:
+        store: memberlist
+
+store_gateway:
+  sharding_enabled: true
+  sharding_ring:
+    replication_factor: 3
+    kvstore:
+      store: memberlist
+      consul:
+        host: consul:8500
+
+distributor:
+  # Better series sharding across instances.
+  shard_by_all_labels: true
+
+  # Deduplicate received series from Prometheus HA pairs.
+  ha_tracker:
+    enable_ha_tracker:         true
+    ha_tracker_update_timeout: 2s
+    ha_tracker_update_timeout_jitter_max: 0s
+    ha_tracker_failover_timeout: 5s
+    kvstore:
+      store: consul
+      consul:
+        host: consul:8500
+
+limits:
+  accept_ha_samples: true
+
+  # No limits.
+  ingestion_rate:        0
+  max_series_per_user:   0
+  max_series_per_metric: 0

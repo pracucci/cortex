@@ -1,0 +1,60 @@
+version: '3.4'
+services:
+
+  cortex:
+    image: quay.io/cortexproject/cortex:latest
+    entrypoint: ""
+    command: ["sh", "-c", "sleep 3 && /bin/cortex -config.file=/cortex/config/cortex.yaml -log.level=warn"]
+    volumes:
+      - ./:/cortex/config
+
+  load-balancer:
+    image: nginx:1.19
+    ports:
+      - 8080:80
+    volumes:
+      - ./:/etc/nginx
+
+  minio:
+    image: minio/minio
+    command: [ "server", "/data" ]
+    environment:
+      - MINIO_ACCESS_KEY=cortex
+      - MINIO_SECRET_KEY=supersecret
+    ports:
+      - 9000:9000
+    volumes:
+      - .data-minio:/data:delegated
+
+  grafana:
+    image: grafana/grafana:7.2.1
+    environment:
+      - GF_LOG_LEVEL=warn
+    ports:
+      - 3000:3000
+
+  prometheus-1:
+    image: prom/prometheus:v2.22.0
+    command: ["--config.file=/etc/prometheus/prometheus-1.yaml"]
+    volumes:
+      - ./:/etc/prometheus
+
+  prometheus-2:
+    image: prom/prometheus:v2.22.0
+    command: ["--config.file=/etc/prometheus/prometheus-2.yaml"]
+    volumes:
+      - ./:/etc/prometheus
+
+  consul:
+    image: consul
+    command: [ "agent", "-dev" ,"-client=0.0.0.0", "-log-level=warn" ]
+    ports:
+      - 8500:8500
+
+  load-generator:
+    image:   pracucci/cortex-load-generator:master-341edbb
+    command:
+      - "--remote-url=http://load-balancer/api/prom/push"
+      - "--remote-write-interval=1s"
+      - "--tenants-count=1"
+      - "--series-count=20000"
