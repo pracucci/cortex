@@ -17,6 +17,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/objstore"
 
 	cortex_tsdb "github.com/cortexproject/cortex/pkg/storage/tsdb"
+	"github.com/cortexproject/cortex/pkg/storage/tsdb/bucketclient"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/concurrency"
 	"github.com/cortexproject/cortex/pkg/util/services"
@@ -87,18 +88,18 @@ func NewBlocksCleaner(cfg BlocksCleanerConfig, bucketClient objstore.Bucket, use
 func (c *BlocksCleaner) starting(ctx context.Context) error {
 	// Run a cleanup so that any other service depending on this service
 	// is guaranteed to start once the initial cleanup has been done.
-	c.runCleanup(ctx)
+	c.runUpdate(ctx)
 
 	return nil
 }
 
 func (c *BlocksCleaner) ticker(ctx context.Context) error {
-	c.runCleanup(ctx)
+	c.runUpdate(ctx)
 
 	return nil
 }
 
-func (c *BlocksCleaner) runCleanup(ctx context.Context) {
+func (c *BlocksCleaner) runUpdate(ctx context.Context) {
 	level.Info(c.logger).Log("msg", "started hard deletion of blocks marked for deletion")
 	c.runsStarted.Inc()
 
@@ -128,7 +129,7 @@ func (c *BlocksCleaner) cleanUsers(ctx context.Context) error {
 
 func (c *BlocksCleaner) cleanUser(ctx context.Context, userID string) error {
 	userLogger := util.WithUserID(userID, c.logger)
-	userBucket := cortex_tsdb.NewUserBucketClient(userID, c.bucketClient)
+	userBucket := bucketclient.NewUserBucketClient(userID, c.bucketClient)
 
 	ignoreDeletionMarkFilter := block.NewIgnoreDeletionMarkFilter(userLogger, userBucket, c.cfg.DeletionDelay, c.cfg.MetaSyncConcurrency)
 
@@ -178,7 +179,7 @@ func (c *BlocksCleaner) cleanUser(ctx context.Context, userID string) error {
 	return nil
 }
 
-func (c *BlocksCleaner) cleanUserPartialBlocks(ctx context.Context, partials map[ulid.ULID]error, userBucket *cortex_tsdb.UserBucketClient, userLogger log.Logger) {
+func (c *BlocksCleaner) cleanUserPartialBlocks(ctx context.Context, partials map[ulid.ULID]error, userBucket *bucketclient.UserBucketClient, userLogger log.Logger) {
 	for blockID, blockErr := range partials {
 		// We can safely delete only blocks which are partial because the meta.json is missing.
 		if blockErr != block.ErrorSyncMetaNotFound {

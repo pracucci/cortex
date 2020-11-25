@@ -902,8 +902,8 @@ func prepare(t *testing.T, compactorCfg Config, bucketClient objstore.Bucket) (*
 	logger := log.NewLogfmtLogger(logs)
 	registry := prometheus.NewRegistry()
 
-	c, err := newCompactor(compactorCfg, storageCfg, logger, registry, func(ctx context.Context) (objstore.Bucket, tsdb.Compactor, compact.Planner, error) {
-		return bucketClient, tsdbCompactor, tsdbPlanner, nil
+	c, err := newCompactor(compactorCfg, storageCfg, logger, registry, func(ctx context.Context) (objstore.InstrumentedBucket, tsdb.Compactor, compact.Planner, error) {
+		return objstore.BucketWithMetrics("test", bucketClient, nil), tsdbCompactor, tsdbPlanner, nil
 	})
 	require.NoError(t, err)
 

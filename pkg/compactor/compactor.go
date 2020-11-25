@@ -24,6 +24,7 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/ring"
 	cortex_tsdb "github.com/cortexproject/cortex/pkg/storage/tsdb"
+	"github.com/cortexproject/cortex/pkg/storage/tsdb/bucketclient"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 	"github.com/cortexproject/cortex/pkg/util/services"
@@ -116,7 +117,7 @@ type Compactor struct {
 
 	// Function that creates bucket client, TSDB planner and compactor using the context.
 	// Useful for injecting mock objects from tests.
-	createDependencies func(ctx context.Context) (objstore.Bucket, tsdb.Compactor, compact.Planner, error)
+	createDependencies func(ctx context.Context) (objstore.InstrumentedBucket, tsdb.Compactor, compact.Planner, error)
 
 	// Users scanner, used to discover users from the bucket.
 	usersScanner *cortex_tsdb.UsersScanner
@@ -124,12 +125,15 @@ type Compactor struct {
 	// Blocks cleaner is responsible to hard delete blocks marked for deletion.
 	blocksCleaner *BlocksCleaner
 
+	// Bucket index writer is responsible to keep the per-tenant bucket index updated.
+	indexWriter *BucketIndexWriter
+
 	// Underlying compactor and planner used to compact TSDB blocks.
 	tsdbCompactor tsdb.Compactor
 	tsdbPlanner   compact.Planner
 
 	// Client used to run operations on the bucket storing blocks.
-	bucketClient objstore.Bucket
+	bucketClient objstore.InstrumentedBucket
 
 	// Ring used for sharding compactions.
 	ringLifecycler         *ring.Lifecycler
@@ -155,7 +159,7 @@ type Compactor struct {
 
 // NewCompactor makes a new Compactor.
 func NewCompactor(compactorCfg Config, storageCfg cortex_tsdb.BlocksStorageConfig, logger log.Logger, registerer prometheus.Registerer) (*Compactor, error) {
-	createDependencies := func(ctx context.Context) (objstore.Bucket, tsdb.Compactor, compact.Planner, error) {
+	createDependencies := func(ctx context.Context) (objstore.InstrumentedBucket, tsdb.Compactor, compact.Planner, error) {
 		bucketClient, err := cortex_tsdb.NewBucketClient(ctx, storageCfg.Bucket, "compactor", logger, registerer)
 		if err != nil {
 			return nil, nil, nil, errors.Wrap(err, "failed to create the bucket client")
@@ -183,7 +187,7 @@ func newCompactor(
 	storageCfg cortex_tsdb.BlocksStorageConfig,
 	logger log.Logger,
 	registerer prometheus.Registerer,
-	createDependencies func(ctx context.Context) (objstore.Bucket, tsdb.Compactor, compact.Planner, error),
+	createDependencies func(ctx context.Context) (objstore.InstrumentedBucket, tsdb.Compactor, compact.Planner, error),
 ) (*Compactor, error) {
 	c := &Compactor{
 		compactorCfg:       compactorCfg,
@@ -325,7 +329,22 @@ func (c *Compactor) starting(ctx context.Context) error {
 		}
 	}
 
+	// Create the bucket index writer (service).
+	c.indexWriter = NewBucketIndexWriter(BucketIndexWriterConfig{
+		// TODO expose the config
+		UpdateInterval: 30 * time.Minute,
+		//UpdateInterval:    time.Minute,
+		UpdateConcurrency: 10,
+	}, c.bucketClient, c.usersScanner, c.parentLogger)
+
+	// Ensure the bucket indexes are updated before starting the compactor.
+	if err := services.StartAndAwaitRunning(ctx, c.indexWriter); err != nil {
+		c.ringSubservices.StopAsync()
+		return errors.Wrap(err, "failed to start the bucket index writer")
+	}
+
 	// Create the blocks cleaner (service).
+	// TODO should leverage on the index
 	c.blocksCleaner = NewBlocksCleaner(BlocksCleanerConfig{
 		DataDir:             c.compactorCfg.DataDir,
 		MetaSyncConcurrency: c.compactorCfg.MetaSyncConcurrency,
@@ -347,6 +366,7 @@ func (c *Compactor) stopping(_ error) error {
 	ctx := context.Background()
 
 	services.StopAndAwaitTerminated(ctx, c.blocksCleaner) //nolint:errcheck
+	services.StopAndAwaitTerminated(ctx, c.indexWriter)   //nolint:errcheck
 	if c.ringSubservices != nil {
 		return services.StopManagerAndAwaitStopped(ctx, c.ringSubservices)
 	}
@@ -459,7 +479,7 @@ func (c *Compactor) compactUsers(ctx context.Context) error {
 }
 
 func (c *Compactor) compactUser(ctx context.Context, userID string) error {
-	bucket := cortex_tsdb.NewUserBucketClient(userID, c.bucketClient)
+	bucket := bucketclient.NewUserBucketClient(userID, c.bucketClient)
 
 	reg := prometheus.NewRegistry()
 	defer c.syncerMetrics.gatherThanosSyncerMetrics(reg)

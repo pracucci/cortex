@@ -30,6 +30,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/ingester/client"
 	"github.com/cortexproject/cortex/pkg/ring"
 	cortex_tsdb "github.com/cortexproject/cortex/pkg/storage/tsdb"
+	"github.com/cortexproject/cortex/pkg/storage/tsdb/bucketclient"
 	"github.com/cortexproject/cortex/pkg/tenant"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/concurrency"
@@ -1259,7 +1260,7 @@ func (i *Ingester) createTSDB(userID string) (*userTSDB, error) {
 			userLogger,
 			tsdbPromReg,
 			udir,
-			cortex_tsdb.NewUserBucketClient(userID, i.TSDBState.bucket),
+			bucketclient.NewUserBucketClient(userID, i.TSDBState.bucket),
 			func() labels.Labels { return l },
 			metadata.ReceiveSource,
 			false, // No need to upload compacted blocks. Cortex compactor takes care of that.

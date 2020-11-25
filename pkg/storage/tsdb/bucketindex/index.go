@@ -11,7 +11,6 @@ import (
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 
-	cortex_tsdb "github.com/cortexproject/cortex/pkg/storage/tsdb"
 	"github.com/cortexproject/cortex/pkg/util"
 )
 
@@ -26,7 +25,7 @@ const (
 	SegmentsFormat1Based6Digits = "1b6d"
 )
 
-// Index contains all known blocks and markers of a tenant.
+// Index contains all known blocks and markers for all blocks of a tenant.
 type Index struct {
 	// Version of the index format.
 	Version int `json:"version"`
@@ -81,7 +80,8 @@ func (m *Block) ThanosMeta(userID string) metadata.Meta {
 		Thanos: metadata.Thanos{
 			Version: metadata.ThanosVersion1,
 			Labels: map[string]string{
-				cortex_tsdb.TenantIDExternalLabel: userID,
+				// TODO cortex_tsdb.TenantIDExternalLabel: userID,
+				"__org_id__": userID,
 			},
 			SegmentFiles: m.thanosMetaSegmentFiles(),
 		},

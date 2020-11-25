@@ -163,15 +163,24 @@ func NewBlocksStoreQueryableFromConfig(querierCfg Config, gatewayCfg storegatewa
 	if err != nil {
 		return nil, errors.Wrap(err, "create caching bucket")
 	}
-	bucketClient = cachingBucket
+	//bucketClient = cachingBucket
 
-	scanner := NewBlocksScanner(BlocksScannerConfig{
-		ScanInterval:             storageCfg.BucketStore.SyncInterval,
-		TenantsConcurrency:       storageCfg.BucketStore.TenantSyncConcurrency,
-		MetasConcurrency:         storageCfg.BucketStore.MetaSyncConcurrency,
-		CacheDir:                 storageCfg.BucketStore.SyncDir,
-		IgnoreDeletionMarksDelay: storageCfg.BucketStore.IgnoreDeletionMarksDelay,
-	}, bucketClient, logger, reg)
+	//scanner := NewBlocksScanner(BlocksScannerConfig{
+	//	ScanInterval:             storageCfg.BucketStore.SyncInterval,
+	//	TenantsConcurrency:       storageCfg.BucketStore.TenantSyncConcurrency,
+	//	MetasConcurrency:         storageCfg.BucketStore.MetaSyncConcurrency,
+	//	CacheDir:                 storageCfg.BucketStore.SyncDir,
+	//	IgnoreDeletionMarksDelay: storageCfg.BucketStore.IgnoreDeletionMarksDelay,
+	//}, bucketClient, logger, reg)
+
+	// TODO add an option to enabled/disable the bucket index usage.
+	scanner, err := NewBlocksIndexQuerier(BlocksIndexQuerierConfig{
+		IndexUpdateInterval: time.Minute,
+		IndexIdleTimeout:    5 * time.Minute,
+	}, cachingBucket, logger)
+	if err != nil {
+		return nil, errors.Wrap(err, "create blocks index querier")
+	}
 
 	if gatewayCfg.ShardingEnabled {
 		storesRingCfg := gatewayCfg.ShardingRing.ToRingConfig()

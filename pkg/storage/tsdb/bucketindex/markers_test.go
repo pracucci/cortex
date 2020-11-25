@@ -1,0 +1,28 @@
+package bucketindex
+
+import (
+	"testing"
+
+	"github.com/oklog/ulid"
+	"github.com/stretchr/testify/assert"
+)
+
+func TestBlockDeletionMarkFilename(t *testing.T) {
+	id := ulid.MustNew(1, nil)
+
+	assert.Equal(t, id.String()+"-deletion-mark.json", BlockDeletionMarkFilename(id))
+}
+
+func TestIsBlockDeletionMarkFilename(t *testing.T) {
+	expected := ulid.MustNew(1, nil)
+
+	actual, ok := IsBlockDeletionMarkFilename("xxx")
+	assert.False(t, ok)
+
+	actual, ok = IsBlockDeletionMarkFilename("xxx-deletion-mark.json")
+	assert.False(t, ok)
+
+	actual, ok = IsBlockDeletionMarkFilename(expected.String() + "-deletion-mark.json")
+	assert.True(t, ok)
+	assert.Equal(t, expected, actual)
+}

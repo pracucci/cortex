@@ -15,7 +15,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	tsdb_errors "github.com/prometheus/prometheus/tsdb/errors"
-	"github.com/thanos-io/thanos/pkg/block"
 	thanos_metadata "github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/extprom"
 	"github.com/thanos-io/thanos/pkg/gate"
@@ -27,6 +26,7 @@ import (
 	"google.golang.org/grpc/metadata"
 
 	"github.com/cortexproject/cortex/pkg/storage/tsdb"
+	"github.com/cortexproject/cortex/pkg/storage/tsdb/bucketclient"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/spanlogger"
 	"github.com/cortexproject/cortex/pkg/util/validation"
@@ -327,46 +327,43 @@ func (u *BucketStores) getOrCreateStore(userID string) (*store.BucketStore, erro
 
 	level.Info(userLogger).Log("msg", "creating user bucket store")
 
-	userBkt := tsdb.NewUserBucketClient(userID, u.bucket)
+	userBkt := bucketclient.NewUserBucketClient(userID, u.bucket)
 
-	// Wrap the bucket reader to skip iterating the bucket at all if the user doesn't
-	// belong to the store-gateway shard. We need to run the BucketStore synching anyway
-	// in order to unload previous tenants in case of a resharding leading to tenants
-	// moving out from the store-gateway shard and also make sure both MetaFetcher and
-	// BucketStore metrics are correctly updated.
-	fetcherBkt := NewShardingBucketReaderAdapter(userID, u.shardingStrategy, userBkt)
+	/*
+		fetcherReg := prometheus.NewRegistry()
+		fetcher, err := block.NewMetaFetcher(
+			userLogger,
+			u.cfg.BucketStore.MetaSyncConcurrency,
+			fetcherBkt,
+			filepath.Join(u.cfg.BucketStore.SyncDir, userID), // The fetcher stores cached metas in the "meta-syncer/" sub directory
+			fetcherReg,
+			// The sharding strategy filter MUST be before the ones we create here (order matters).
+			append([]block.MetadataFilter{NewShardingMetadataFilterAdapter(userID, u.shardingStrategy)}, []block.MetadataFilter{
+				block.NewConsistencyDelayMetaFilter(userLogger, u.cfg.BucketStore.ConsistencyDelay, fetcherReg),
+				block.NewIgnoreDeletionMarkFilter(userLogger, userBkt, u.cfg.BucketStore.IgnoreDeletionMarksDelay, u.cfg.BucketStore.MetaSyncConcurrency),
+				// The duplicate filter has been intentionally omitted because it could cause troubles with
+				// the consistency check done on the querier. The duplicate filter removes redundant blocks
+				// but if the store-gateway removes redundant blocks before the querier discovers them, the
+				// consistency check on the querier will fail.
+			}...),
+			[]block.MetadataModifier{
+				// Remove Cortex external labels so that they're not injected when querying blocks.
+				NewReplicaLabelRemover(userLogger, []string{
+					tsdb.TenantIDExternalLabel,
+					tsdb.IngesterIDExternalLabel,
+					tsdb.ShardIDExternalLabel,
+				}),
+			},
+		)
+		if err != nil {
+			return nil, err
+		}
+	*/
 
-	fetcherReg := prometheus.NewRegistry()
-	fetcher, err := block.NewMetaFetcher(
-		userLogger,
-		u.cfg.BucketStore.MetaSyncConcurrency,
-		fetcherBkt,
-		filepath.Join(u.cfg.BucketStore.SyncDir, userID), // The fetcher stores cached metas in the "meta-syncer/" sub directory
-		fetcherReg,
-		// The sharding strategy filter MUST be before the ones we create here (order matters).
-		append([]block.MetadataFilter{NewShardingMetadataFilterAdapter(userID, u.shardingStrategy)}, []block.MetadataFilter{
-			block.NewConsistencyDelayMetaFilter(userLogger, u.cfg.BucketStore.ConsistencyDelay, fetcherReg),
-			block.NewIgnoreDeletionMarkFilter(userLogger, userBkt, u.cfg.BucketStore.IgnoreDeletionMarksDelay, u.cfg.BucketStore.MetaSyncConcurrency),
-			// The duplicate filter has been intentionally omitted because it could cause troubles with
-			// the consistency check done on the querier. The duplicate filter removes redundant blocks
-			// but if the store-gateway removes redundant blocks before the querier discovers them, the
-			// consistency check on the querier will fail.
-		}...),
-		[]block.MetadataModifier{
-			// Remove Cortex external labels so that they're not injected when querying blocks.
-			NewReplicaLabelRemover(userLogger, []string{
-				tsdb.TenantIDExternalLabel,
-				tsdb.IngesterIDExternalLabel,
-				tsdb.ShardIDExternalLabel,
-			}),
-		},
-	)
-	if err != nil {
-		return nil, err
-	}
+	fetcher := NewMetadataFetcher(userID, u.bucket, u.cfg.BucketStore.MetaSyncConcurrency, u.shardingStrategy, u.logger)
 
 	bucketStoreReg := prometheus.NewRegistry()
-	bs, err = store.NewBucketStore(
+	bs, err := store.NewBucketStore(
 		userLogger,
 		bucketStoreReg,
 		userBkt,
@@ -390,7 +387,7 @@ func (u *BucketStores) getOrCreateStore(userID string) (*store.BucketStore, erro
 	}
 
 	u.stores[userID] = bs
-	u.metaFetcherMetrics.AddUserRegistry(userID, fetcherReg)
+	//u.metaFetcherMetrics.AddUserRegistry(userID, fetcherReg)
 	u.bucketStoreMetrics.AddUserRegistry(userID, bucketStoreReg)
 
 	return bs, nil

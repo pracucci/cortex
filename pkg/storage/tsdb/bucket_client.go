@@ -12,10 +12,14 @@ import (
 	"github.com/cortexproject/cortex/pkg/storage/backend/gcs"
 	"github.com/cortexproject/cortex/pkg/storage/backend/s3"
 	"github.com/cortexproject/cortex/pkg/storage/backend/swift"
+	"github.com/cortexproject/cortex/pkg/storage/tsdb/bucketindex"
 )
 
 // NewBucketClient creates a new bucket client based on the configured backend
-func NewBucketClient(ctx context.Context, cfg BucketConfig, name string, logger log.Logger, reg prometheus.Registerer) (client objstore.Bucket, err error) {
+func NewBucketClient(ctx context.Context, cfg BucketConfig, name string, logger log.Logger, reg prometheus.Registerer) (objstore.InstrumentedBucket, error) {
+	var client objstore.Bucket
+	var err error
+
 	switch cfg.Backend {
 	case BackendS3:
 		client, err = s3.NewBucketClient(cfg.S3, name, logger)
@@ -35,17 +39,17 @@ func NewBucketClient(ctx context.Context, cfg BucketConfig, name string, logger 
 		return nil, err
 	}
 
-	client = objstore.NewTracingBucket(bucketWithMetrics(client, name, reg))
+	wrapped := objstore.NewTracingBucket(bucketWithMetrics(bucketindex.BucketWithMarkersIndex(client), name, reg))
 
 	// Wrap the client with any provided middleware
 	for _, wrap := range cfg.Middlewares {
-		client, err = wrap(client)
+		wrapped, err = wrap(wrapped)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	return client, nil
+	return wrapped, nil
 }
 
 func bucketWithMetrics(bucketClient objstore.Bucket, name string, reg prometheus.Registerer) objstore.Bucket {
