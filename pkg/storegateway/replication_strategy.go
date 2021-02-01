@@ -36,7 +36,8 @@ func (s *BlocksReplicationStrategy) ShouldExtendReplicaSet(instance ring.Ingeste
 		// - JOINING: the previous replica set should be kept while an instance is JOINING
 		// - LEAVING: the instance is going to be decommissioned soon so we need to include
 		//   		  another replica in the set
-		return instance.GetState() == ring.JOINING || instance.GetState() == ring.LEAVING
+		// return instance.GetState() == ring.JOINING || instance.GetState() == ring.LEAVING
+		return false
 	case ring.BlocksRead:
 		return false
 	default:

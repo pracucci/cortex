@@ -232,13 +232,6 @@ func (g *StoreGateway) starting(ctx context.Context) (err error) {
 		level.Info(g.logger).Log("msg", "store-gateway is JOINING in the ring")
 	}
 
-	// At this point, if sharding is enabled, the instance is registered with some tokens
-	// and we can run the initial synchronization.
-	g.bucketSync.WithLabelValues(syncReasonInitial).Inc()
-	if err = g.stores.InitialSync(ctx); err != nil {
-		return errors.Wrap(err, "initial blocks synchronization")
-	}
-
 	if g.gatewayCfg.ShardingEnabled {
 		// Now that the initial sync is done, we should have loaded all blocks
 		// assigned to our shard, so we can switch to ACTIVE and start serving
@@ -271,6 +264,13 @@ func (g *StoreGateway) starting(ctx context.Context) (err error) {
 				level.Info(g.logger).Log("msg", "store-gateway ring topology is stable")
 			}
 		}
+	}
+
+	// At this point, if sharding is enabled, the instance is registered with some tokens
+	// and we can run the initial synchronization.
+	g.bucketSync.WithLabelValues(syncReasonInitial).Inc()
+	if err = g.stores.InitialSync(ctx); err != nil {
+		return errors.Wrap(err, "initial blocks synchronization")
 	}
 
 	return nil
