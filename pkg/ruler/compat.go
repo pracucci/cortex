@@ -2,11 +2,13 @@ package ruler
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/go-kit/kit/log"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/notifier"
+	"github.com/prometheus/prometheus/pkg/exemplar"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/value"
 	"github.com/prometheus/prometheus/promql"
@@ -63,6 +65,10 @@ func (a *pusherAppender) Rollback() error {
 	a.labels = nil
 	a.samples = nil
 	return nil
+}
+
+func (a *pusherAppender) AppendExemplar(_ uint64, _ labels.Labels, _ exemplar.Exemplar) (uint64, error) {
+	return 0, errors.New("unsupported")
 }
 
 // PusherAppendable fulfills the storage.Appendable interface for prometheus manager

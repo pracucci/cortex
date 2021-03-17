@@ -70,6 +70,9 @@ require (
 	sigs.k8s.io/yaml v1.2.0
 )
 
+// Test PromQL aggregation optimization (PR #8594)
+replace github.com/prometheus/prometheus => github.com/pracucci/prometheus v1.8.2-0.20210316165519-894def610b0f
+
 // Override since git.apache.org is down.  The docs say to fetch from github.
 replace git.apache.org/thrift.git => github.com/apache/thrift v0.0.0-20180902110319-2566ecd5d999
 
