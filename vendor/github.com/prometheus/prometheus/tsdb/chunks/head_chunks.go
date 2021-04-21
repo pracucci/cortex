@@ -29,6 +29,8 @@ import (
 	"github.com/pkg/errors"
 	"go.uber.org/atomic"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	tsdb_errors "github.com/prometheus/prometheus/tsdb/errors"
 	"github.com/prometheus/prometheus/tsdb/fileutil"
@@ -455,6 +457,12 @@ func (cdm *ChunkDiskMapper) flushBuffer() error {
 	return nil
 }
 
+
+var allocatedMem = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "prometheus_tsdb_head_chunks_copy_chunk_memory_allocated_total",
+	Help: "Total bytes allocated due to chunk copy in the head chunks mapper.",
+})
+
 // Chunk returns a chunk from a given reference.
 func (cdm *ChunkDiskMapper) Chunk(ref uint64) (chunkenc.Chunk, error) {
 	cdm.readPathMtx.RLock()
@@ -556,7 +564,15 @@ func (cdm *ChunkDiskMapper) Chunk(ref uint64) (chunkenc.Chunk, error) {
 
 	// The chunk data itself.
 	chkData := mmapFile.byteSlice.Range(chkDataEnd-int(chkDataLen), chkDataEnd)
-	chk, err := cdm.pool.Get(chunkenc.Encoding(chkEnc), chkData)
+
+	// Make a copy of the chunk data to prevent a panic occurring because the returned
+	// chunk data slice references an mmap-ed file which could be closed after the
+	// function returns but while the chunk is still in use.
+	chkDataCopy := make([]byte, len(chkData))
+	copy(chkDataCopy, chkData)
+	allocatedMem.Add(float64(len(chkData)))
+
+	chk, err := cdm.pool.Get(chunkenc.Encoding(chkEnc), chkDataCopy)
 	if err != nil {
 		return nil, &CorruptionErr{
 			Dir:       cdm.dir.Name(),
