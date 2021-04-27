@@ -3,9 +3,12 @@ package distributor
 import (
 	"context"
 	"io"
+	"sort"
 	"time"
 
 	"github.com/opentracing/opentracing-go"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/weaveworks/common/instrument"
@@ -172,6 +175,21 @@ func (d *Distributor) queryIngesters(ctx context.Context, replicationSet ring.Re
 	return result, nil
 }
 
+// TODO move
+var (
+	// TODO no global registry
+	chunksFetchedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "cortex",
+		Name:      "distributor_ingester_chunks_fetched_total",
+		Help:      "TODO",
+	})
+	chunksDeduplicatedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "cortex",
+		Name:      "distributor_ingester_chunks_deduplicated_total",
+		Help:      "TODO",
+	})
+)
+
 // queryIngesterStream queries the ingesters using the new streaming API.
 func (d *Distributor) queryIngesterStream(ctx context.Context, replicationSet ring.ReplicationSet, req *ingester_client.QueryRequest) (*ingester_client.QueryStreamResponse, error) {
 	// Fetch samples from multiple ingesters
@@ -239,6 +257,39 @@ func (d *Distributor) queryIngesterStream(ctx context.Context, replicationSet ri
 			}
 			hashToTimeSeries[key] = existing
 		}
+	}
+
+	// TODO benchmark
+	// TODO enable with a temporarily flag to test it
+	// TODO enable only if RF > 1
+	// TODO log in the span
+	// TODO unit test
+	for hash, series := range hashToChunkseries {
+		chunks := series.Chunks
+
+		sort.Slice(chunks, func(i, j int) bool {
+			if chunks[i].StartTimestampMs != chunks[j].StartTimestampMs {
+				return chunks[i].StartTimestampMs < chunks[j].StartTimestampMs
+			}
+
+			return chunks[i].EndTimestampMs < chunks[j].EndTimestampMs
+		})
+
+		deduplicated := make([]ingester_client.Chunk, 0, len(chunks))
+		for _, chunk := range chunks {
+			if len(deduplicated) == 0 || !deduplicated[len(deduplicated)-1].Equal(chunk) {
+				deduplicated = append(deduplicated, chunk)
+			}
+		}
+
+		chunksFetchedTotal.Add(float64(len(chunks)))
+		chunksDeduplicatedTotal.Add(float64(len(chunks) - len(deduplicated)))
+
+		//fmt.Println("chunks:      ", chunks)
+		//fmt.Println("deduplicated:", deduplicated)
+
+		series.Chunks = deduplicated
+		hashToChunkseries[hash] = series
 	}
 
 	resp := &ingester_client.QueryStreamResponse{
