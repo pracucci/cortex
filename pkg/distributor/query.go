@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/opentracing/opentracing-go"
@@ -189,6 +190,9 @@ func (d *Distributor) queryIngesterStream(ctx context.Context, userID string, re
 	var (
 		chunksLimit = d.limits.MaxChunksPerQueryFromIngesters(userID)
 		chunksCount = atomic.Int32{}
+
+		uniqueSeriesMtx sync.Mutex
+		uniqueSeries    = map[model.Fingerprint]struct{}{}
 	)
 
 	// Fetch samples from multiple ingesters
@@ -230,6 +234,22 @@ func (d *Distributor) queryIngesterStream(ctx context.Context, userID string, re
 					return nil, validation.LimitError(fmt.Sprintf(errMaxChunksPerQueryLimit, util.LabelMatchersToString(matchers), chunksLimit))
 				}
 			}
+
+			uniqueSeriesMtx.Lock()
+			for _, series := range resp.Chunkseries {
+				fp := ingester_client.FastFingerprint(series.Labels)
+				uniqueSeries[fp] = struct{}{}
+			}
+			for _, series := range resp.Timeseries {
+				fp := ingester_client.FastFingerprint(series.Labels)
+				uniqueSeries[fp] = struct{}{}
+			}
+			//limitHit := len(uniqueSeries) > limit
+			uniqueSeriesMtx.Unlock()
+
+			//if limitHit {
+			//	return validation.LimitError("bla bla")
+			//}
 
 			result.Chunkseries = append(result.Chunkseries, resp.Chunkseries...)
 			result.Timeseries = append(result.Timeseries, resp.Timeseries...)

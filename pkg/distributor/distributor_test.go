@@ -870,6 +870,44 @@ func TestDistributor_PushQuery(t *testing.T) {
 	}
 }
 
+func BenchmarkDistributor_QueryStream(b *testing.B) {
+	const numSeries = 100000 // 100K
+
+	limits := &validation.Limits{}
+	flagext.DefaultValues(limits)
+	limits.IngestionRate = 1000000      // 1M
+	limits.IngestionBurstSize = 1000000 // 1M
+
+	// Prepare distributors.
+	ds, _, r, _ := prepare(b, prepConfig{
+		numIngesters:     3,
+		happyIngesters:   3,
+		numDistributors:  1,
+		shardByAllLabels: true,
+		limits:           limits,
+	})
+	defer stopAll(ds, r)
+
+	// Push series.
+	writeReq := makeWriteRequest(0, numSeries, 0)
+	writeRes, err := ds[0].Push(ctx, writeReq)
+	assert.Equal(b, &cortexpb.WriteResponse{}, writeRes)
+	assert.Nil(b, err)
+
+	allSeriesMatchers := []*labels.Matcher{
+		labels.MustNewMatcher(labels.MatchRegexp, model.MetricNameLabel, ".+"),
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for n := 0; n < b.N; n++ {
+		queryRes, err := ds[0].QueryStream(ctx, math.MinInt32, math.MaxInt32, allSeriesMatchers...)
+		require.NoError(b, err)
+		assert.Len(b, queryRes.Chunkseries, numSeries)
+	}
+}
+
 func TestDistributor_QueryStream_ShouldReturnErrorIfMaxChunksPerQueryLimitIsReached(t *testing.T) {
 	const maxChunksLimit = 30 // Chunks are duplicated due to replication factor.
 
@@ -1685,7 +1723,7 @@ type prepConfig struct {
 	maxIngestionRate             float64
 }
 
-func prepare(t *testing.T, cfg prepConfig) ([]*Distributor, []mockIngester, *ring.Ring, []*prometheus.Registry) {
+func prepare(t testing.TB, cfg prepConfig) ([]*Distributor, []mockIngester, *ring.Ring, []*prometheus.Registry) {
 	ingesters := []mockIngester{}
 	for i := 0; i < cfg.happyIngesters; i++ {
 		ingesters = append(ingesters, mockIngester{
@@ -1805,9 +1843,11 @@ func stopAll(ds []*Distributor, r *ring.Ring) {
 	r.StopAsync()
 }
 
-func makeWriteRequest(startTimestampMs int64, samples int, metadata int) *cortexpb.WriteRequest {
+// makeWriteRequest creates a cortexpb.WriteRequest with numSeries with 1 sample each
+// and numMetadata.
+func makeWriteRequest(startTimestampMs int64, numSeries int, numMetadata int) *cortexpb.WriteRequest {
 	request := &cortexpb.WriteRequest{}
-	for i := 0; i < samples; i++ {
+	for i := 0; i < numSeries; i++ {
 		request.Timeseries = append(request.Timeseries, makeWriteRequestTimeseries(
 			[]cortexpb.LabelAdapter{
 				{Name: model.MetricNameLabel, Value: "foo"},
@@ -1816,7 +1856,7 @@ func makeWriteRequest(startTimestampMs int64, samples int, metadata int) *cortex
 			}, startTimestampMs+int64(i), float64(i)))
 	}
 
-	for i := 0; i < metadata; i++ {
+	for i := 0; i < numMetadata; i++ {
 		m := &cortexpb.MetricMetadata{
 			MetricFamilyName: fmt.Sprintf("metric_%d", i),
 			Type:             cortexpb.COUNTER,
